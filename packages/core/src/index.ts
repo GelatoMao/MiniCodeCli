@@ -9,3 +9,8 @@ export { getAvailableProviders, resolveModelId, getEnvVarName, getProviderOption
 
 // ─── Providers ───
 export { createModelRegistry, permanentErrorFetch } from './providers/registry.js'
+
+// ─── Agent ───
+export { agentLoop, createLoopState } from './agent/loop.js'
+export type { LoopState, AgentLoopResult } from './agent/loop.js'
+export type { StreamResult } from './agent/stream-utils.js'
