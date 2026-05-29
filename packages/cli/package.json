@@ -1,0 +1,27 @@
+{
+  "name": "@mini-code-cli/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "mini-code": "dist/cli.js",
+    "mc": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@mini-code-cli/core": "workspace:*",
+    "chalk": "^5.4.0",
+    "ink": "npm:@jrichman/ink@6.6.9",
+    "marked": "^17.0.1",
+    "react": "^19.1.0",
+    "yargs": "^18.0.0"
+  }
+}
