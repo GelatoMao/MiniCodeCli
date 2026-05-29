@@ -7,7 +7,7 @@
 | 任务 | 主题 | 文件 | 状态 |
 |------|------|------|------|
 | 任务 1 | 搭建 pnpm monorepo 双包结构 | [task-01-monorepo.md](./task-01-monorepo.md) | ✅ 完成 |
-| 任务 2 | Provider 注册表（最小 Anthropic 接入） | [task-02-provider-registry.md](./task-02-provider-registry.md) | ⏳ 待完成 |
+| 任务 2 | Provider 注册表（最小 Anthropic 接入） | [task-02-provider-registry.md](./task-02-provider-registry.md) | ✅ 完成 |
 | 任务 3 | 最简 agentLoop（单轮 streamText） | [task-03-agent-loop.md](./task-03-agent-loop.md) | ⏳ 待完成 |
 | 任务 4 | 基础文件工具 | [task-04-file-tools.md](./task-04-file-tools.md) | ⏳ 待完成 |
 | 任务 5 | Shell 工具 + 权限系统 | [task-05-shell-permissions.md](./task-05-shell-permissions.md) | ⏳ 待完成 |
