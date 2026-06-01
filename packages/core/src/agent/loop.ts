@@ -1,24 +1,36 @@
-// @mini-code-cli/core — Agent Loop（编排：流式 streaming + 单轮 streamText）
+// @mini-code-cli/core — Agent Loop（编排：流式 streaming + 完整 ReAct 工具调用循环）
 //
-// 本文件是 task3 的最小实现版本：
-//   - 只处理 finishReason === 'stop'（纯文字回答）
-//   - 不处理工具调用（task6 才接入完整 ReAct 循环）
-//   - 不做 context 压缩、plan-mode、sub-agent（后续 task 逐步叠加）
+// task6 在 task3 基础上新增：
+//   - buildTools()：汇总工具注册表，传给 streamText
+//   - finishReason === 'tool-calls' 分支：调用 processToolCalls 执行工具，继续循环
+//   - finishReason === 'length' 分支：推入续写提示，最多续写 3 次（MAX_CONTINUATIONS）
+//   - runTurn 前调用 repairOrphanToolCalls（防御性修复孤立 tool_call）
+//   - collectTurnResponse 里调用 truncateToolResultsInMessages（auto-execute 结果截断）
+//   - 在 streamChunksToUI 里注册 progress reporter（setProgressReporter）
 //
 // 核心函数调用链：
 //   agentLoop
-//     └─ runTurn
-//           ├─ streamText (AI SDK)
-//           ├─ streamChunksToUI  (消费 fullStream，分发 callbacks)
-//           └─ collectTurnResponse (收集 response/usage 写入 state)
+//     └─ while loop
+//           ├─ runTurn
+//           │     ├─ repairOrphanToolCalls（防御性修复）
+//           │     ├─ streamText（传 tools）
+//           │     ├─ streamChunksToUI（含 progress reporter 注册）
+//           │     └─ collectTurnResponse（含 truncateToolResultsInMessages）
+//           ├─ 'stop'    → break（正常结束）
+//           ├─ 'tool-calls' → processToolCalls → continue（ReAct 循环）
+//           └─ 'length'  → push 续写提示 → continue（最多 3 次）
 import { streamText } from 'ai'
 import type { LanguageModel, UserContent } from 'ai'
 
+import { toolRegistry, truncateToolResult } from '../tools/index.js'
+import { clearProgressReporter, setProgressReporter } from '../tools/progress.js'
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
 import { createLoopState } from './loop-state.js'
 import type { LoopState } from './loop-state.js'
 import { drainStreamResult } from './stream-utils.js'
 import type { StreamResult } from './stream-utils.js'
+import { processToolCalls } from './tool-execution.js'
+import { repairOrphanToolCalls, truncateToolResultsInMessages } from './tool-result-sanitize.js'
 
 // ── 重导出 ───────────────────────────────────────────────────────────────────
 
@@ -39,21 +51,37 @@ export interface AgentLoopResult {
   turnCount: number
 }
 
+// ── buildTools ───────────────────────────────────────────────────────────────
+
+/** 构建本次 session 的工具集。
+ *
+ *  task6 阶段：返回静态 toolRegistry（readFile/writeFile/edit/glob/grep/listDir/shell）。
+ *  task15 会在这里动态注入 task 工具（sub-agent）。
+ *  task16 会注入 MCP 工具。
+ *
+ *  - 有 execute 的工具（readFile/glob/grep/listDir）：AI SDK 在 fullStream 内部自动执行
+ *  - 无 execute 的工具（writeFile/edit/shell）：产出 tool-call chunk，
+ *    由 agentLoop 在 finishReason='tool-calls' 时调用 processToolCalls 手动处理*/
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildTools(_options: AgentOptions): Record<string, any> {
+  return { ...toolRegistry }
+}
+
 // ── streamChunksToUI ─────────────────────────────────────────────────────────
 
 /** 消费 streamText 的 fullStream，将各类 chunk 分发给 UI callbacks。
  *
  *  chunk 处理规则：
  *    text-delta   → callbacks.onTextDelta（用户可见的文字流）
- *    tool-call    → callbacks.onToolCall（告知 UI 工具即将执行）
- *    tool-result  → callbacks.onToolResult（auto-execute 工具的执行结果）
+ *    tool-call    → setProgressReporter + callbacks.onToolCall（告知 UI 工具即将执行）
+ *    tool-result  → clearProgressReporter + callbacks.onToolResult（auto-execute 工具结果）
  *    error        → 重新 throw（SDK 不从 fullStream 迭代中 throw，而是放进 chunk）
- *    其他         → 静默丢弃（reasoning-delta、reasoning-start 等思考链内容
- *                  是模型内部思考过程，不向用户展示）
+ *    其他         → 静默丢弃（reasoning-delta 等思考链内容不向用户展示）
  *
- *  为什么不直接用 result.text？
- *    result.text 需要等整个流结束才能解析，无法做流式 UI 更新。
- *    fullStream 可以边生成边推送 delta，体验更好。*/
+ *  为什么在 tool-call 时注册 progress reporter？
+ *    AI SDK 会在 tool-call event 之后同步调用 auto-execute 工具的 execute()，
+ *    execute() 内部通过 reportProgress(toolCallId) 向 UI 推送实时状态。
+ *    必须在 tool-call event 时（执行开始前）注册，否则首批 progress 消息丢失。*/
 async function streamChunksToUI(result: StreamResult, callbacks: AgentCallbacks): Promise<void> {
   for await (const chunk of result.fullStream) {
     if (chunk.type === 'error') {
@@ -66,22 +94,23 @@ async function streamChunksToUI(result: StreamResult, callbacks: AgentCallbacks)
     }
 
     if (chunk.type === 'text-delta') {
-      // 流式文字 delta — 直接推给 UI 渲染
       callbacks.onTextDelta(chunk.text ?? '')
     } else if (chunk.type === 'tool-call') {
-      // 模型决定调用工具 — 通知 UI 显示工具调用行
-      // toolCallId 用于后续的 onToolResult / onToolProgress 配对
+      const toolCallId = chunk.toolCallId ?? ''
+      // 在工具执行开始前注册 progress reporter，确保 execute() 内部能推送进度
+      if (toolCallId) {
+        setProgressReporter(toolCallId, (msg) => callbacks.onToolProgress(toolCallId, msg))
+      }
       callbacks.onToolCall(
-        chunk.toolCallId ?? '',
+        toolCallId,
         chunk.toolName ?? '',
         (chunk.input ?? {}) as Record<string, unknown>,
       )
     } else if (chunk.type === 'tool-result') {
-      // auto-execute 工具（readFile、glob 等内置工具）的结果
-      // 通过 result.toolCalls 收集的是手动分发工具，
-      // 而这里的 tool-result chunk 是 AI SDK 直接执行的结果
+      // auto-execute 工具（readFile/glob 等）的结果
       const raw = typeof chunk.output === 'string' ? chunk.output : JSON.stringify(chunk.output ?? '')
-      callbacks.onToolResult(chunk.toolCallId ?? '', raw)
+      if (chunk.toolCallId) clearProgressReporter(chunk.toolCallId)
+      callbacks.onToolResult(chunk.toolCallId ?? '', truncateToolResult(raw))
     }
     // 其他 chunk 类型（reasoning-delta 等）— 静默丢弃
   }
@@ -93,43 +122,29 @@ async function streamChunksToUI(result: StreamResult, callbacks: AgentCallbacks)
  *
  *  调用时机：streamChunksToUI 完成（fullStream 消耗完）之后。
  *
- *  主要工作：
- *    1. await result.response — 获取本轮产生的消息（assistant + tool_result）
- *    2. 将这些消息 push 进 state.messages，维护完整会话历史
- *    3. await result.usage   — 获取 token 用量
- *    4. 累加到 state.tokenUsage，更新 lastInputTokens 和 currentContextTokens
- *    5. 调用 callbacks.onUsageUpdate 通知 UI 刷新 token 计数器
- *    6. 返回 finishReason（'stop' / 'tool-calls' / 'length' / ...）*/
+ *  task6 新增：
+ *    - 在 push 之前调用 truncateToolResultsInMessages，防止 auto-execute 工具
+ *      的超长结果（如 grep 匹配 2000 行）在每轮请求中占满 context window。*/
 async function collectTurnResponse(
   result: StreamResult,
   state: LoopState,
   callbacks: AgentCallbacks,
 ): Promise<string> {
-  // 等待 response — 包含本轮 assistant 消息和 auto-execute 工具结果
   const response = await result.response
+  // 截断 auto-execute 工具结果（手动路径已经截断，这里处理 SDK 自动执行的部分）
+  truncateToolResultsInMessages(response.messages)
   // 将本轮产生的所有消息追加到 state.messages，维护完整历史
   state.messages.push(...response.messages)
 
-  // 等待 usage — 获取 token 计数
   const usage = await result.usage
   if (usage) {
     state.tokenUsage.inputTokens += usage.inputTokens ?? 0
     state.tokenUsage.outputTokens += usage.outputTokens ?? 0
-
-    // AI SDK v6 将各厂商的 cache 字段归一化到 inputTokenDetails：
-    //   cacheReadTokens  ← Anthropic cache_read_input_tokens / OpenAI cached_tokens
-    //   cacheWriteTokens ← Anthropic cache_creation_input_tokens（其他厂商: 0）
-    // 两者都是 inputTokens 的子集，不重复计入 total
     state.tokenUsage.cacheReadTokens += usage.inputTokenDetails?.cacheReadTokens ?? 0
     state.tokenUsage.cacheCreationTokens += usage.inputTokenDetails?.cacheWriteTokens ?? 0
     state.tokenUsage.totalTokens = state.tokenUsage.inputTokens + state.tokenUsage.outputTokens
-
-    // currentContextTokens = 本轮 input + output，反映当前上下文窗口占用
-    // 用于 UI 底部状态栏的 "N / M · X%" 指标（非累计，每轮覆盖）
     state.tokenUsage.currentContextTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
     if (usage.inputTokens != null) state.lastInputTokens = usage.inputTokens
-
-    // 通知 UI 刷新 token 计数器
     callbacks.onUsageUpdate(state.tokenUsage)
   }
 
@@ -169,61 +184,52 @@ function isAbortError(err: unknown, signal: AbortSignal | undefined): boolean {
 
 /** 执行单轮 streamText 调用。
  *
- *  职责：
- *    1. 调用 AI SDK 的 streamText，传入 model、messages、system prompt 等
- *    2. 调用 streamChunksToUI 消费 fullStream，将 delta 推给 UI
- *    3. 调用 collectTurnResponse 收集 response/usage 写入 state
- *    4. 将各类错误（abort / api error）规范化为 TurnOutcome 返回
- *
- *  不直接处理工具调用 — 调用方（agentLoop）检查 finishReason 后决定是否进入
- *  工具执行分支（task6 实现）。*/
+ *  task6 相比 task3 的变化：
+ *    1. 接受 effectiveTools 参数并传给 streamText
+ *    2. 在调用 streamText 前执行 repairOrphanToolCalls（防御性修复）*/
 async function runTurn(
   state: LoopState,
   model: LanguageModel,
   options: AgentOptions,
   systemPrompt: string,
   callbacks: AgentCallbacks,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  effectiveTools: Record<string, any>,
 ): Promise<TurnOutcome> {
+  // 防御性修复：在每次 API 调用前确保 tool_call ↔ tool_result 配对完整。
+  // 如果上一轮有孤立的 tool_call（模型输出 malformed 工具输入 → SDK 校验拒绝
+  // 且未产生配对 result），这里会合成一条错误 result，防止 422。
+  repairOrphanToolCalls(state.messages)
+
   let result: StreamResult
   try {
-    // streamText 返回一个"立即可读"的结果对象 — 它内部已经发起了 fetch 请求，
-    // fullStream 是一个 async iterable，消费时才真正消耗网络 IO。
-    // 这里不需要 await，只是创建对象。
     result = streamText({
       model,
       system: systemPrompt,
       messages: state.messages,
-      // 无工具（task3 阶段），tools 不传
+      tools: effectiveTools,
       maxRetries: 3,
       abortSignal: options.abortSignal,
-      // 屏蔽 SDK 默认的 console.error(error)（会把完整 RetryError 堆栈 dump 到 stderr）
-      // 我们在下面的 catch 中用 callbacks.onError 给用户展示友好信息
       onError: () => {},
     }) as unknown as StreamResult
   } catch (err) {
-    // streamText 同步抛出（极少见，通常是参数校验失败）
     if (isAbortError(err, options.abortSignal)) return { kind: 'aborted' }
     callbacks.onError(err instanceof Error ? err : new Error(String(err)))
     return { kind: 'error' }
   }
 
-  // 提前给所有兄弟 Promise 挂上 noop catch，防止 Node.js unhandledRejection
-  // 在我们进入错误处理分支之前先触发。幂等操作，无副作用。
+  // 预先给所有兄弟 Promise 挂 noop catch，防止 Node.js unhandledRejection
   drainStreamResult(result)
 
-  // 消费 fullStream，分发 chunk 给 UI
   try {
     await streamChunksToUI(result, callbacks)
   } catch (err) {
-    // 流中途出错（网络断开、provider 返回 4xx/5xx 等）
-    // 再次 drain，防止后续 await 触发 unhandledRejection
     drainStreamResult(result)
     if (isAbortError(err, options.abortSignal)) return { kind: 'aborted' }
     callbacks.onError(err instanceof Error ? err : new Error(String(err)))
     return { kind: 'error' }
   }
 
-  // 收集 response + usage 写入 state
   try {
     const finishReason = await collectTurnResponse(result, state, callbacks)
     return { kind: 'done', finishReason, result }
@@ -239,10 +245,11 @@ async function runTurn(
 
 /** 主 agent 循环。
  *
- *  task3 阶段的简化版本：
- *    - 只处理 finishReason === 'stop'（纯文字回答，模型自然结束）
- *    - finishReason === 'tool-calls' 时打印警告并退出（task6 完整实现）
- *    - finishReason === 'length' 时报错（task6 可选扩展为自动续写）
+ *  task6 完整 ReAct 实现：
+ *    - 传入 tools 给 streamText，使模型能调用工具
+ *    - finishReason === 'tool-calls' → processToolCalls → 继续循环
+ *    - finishReason === 'length' → 推入续写提示，最多 MAX_CONTINUATIONS 次
+ *    - 循环守卫（loop-guard.ts）防止模型陷入死循环
  *
  *  @param userMessage 用户输入（字符串或多模态内容）
  *  @param model       AI SDK LanguageModel 实例（由 registry.languageModel() 创建）
@@ -257,60 +264,87 @@ export async function agentLoop(
   callbacks: AgentCallbacks,
   existingState?: LoopState,
 ): Promise<AgentLoopResult> {
-  // 使用已有 state（多轮对话续接）或创建新 state（会话首次提交）
   const state = existingState ?? createLoopState(options.permissionMode ?? 'default')
 
   // 将用户消息推入历史
   state.messages.push({ role: 'user', content: userMessage })
 
-  // 每次 agentLoop 调用独立的 turn 计数器（不跨次累计）
   let turn = 0
 
-  // task3 使用静态系统提示，task-A 会替换为 buildSystemPrompt()
+  // task6 使用静态系统提示，task-A 会替换为 buildSystemPrompt()
   const systemPrompt =
     options.systemPromptExtra ??
-    'You are a helpful AI assistant. Respond concisely and accurately to the user\'s questions.'
+    "You are a helpful AI assistant. Respond concisely and accurately to the user's questions."
 
-  // No `maxTurns` → 运行到模型 stop 或用户中断
-  // task3 阶段不会无限循环（只处理 stop，遇到 tool-calls 就退出）
+  // 构建工具集（本次 session 内稳定，不需要每轮重建）
+  const effectiveTools = buildTools(options)
+
+  // 自动续写：finishReason === 'length' 时推入续写提示，最多续写 MAX_CONTINUATIONS 次。
+  // 推理模型在输出 token 不足前有时会截断回答——
+  // 旧行为是直接报错，看起来像是程序崩溃；续写机制让回答能自然完成。
+  const MAX_CONTINUATIONS = 3
+  let continuationAttempts = 0
+  // 追踪是否以正常 stop 退出循环（用于判断是否满足"正常完成"语义）
+  let completedNormally = false
+
   while (options.maxTurns === undefined || turn < options.maxTurns) {
     turn++
 
-    const outcome = await runTurn(state, model, options, systemPrompt, callbacks)
+    const outcome = await runTurn(state, model, options, systemPrompt, callbacks, effectiveTools)
 
     if (outcome.kind === 'error') break
     if (outcome.kind === 'aborted') break
 
-    if (outcome.finishReason === 'stop') {
-      // 正常结束 — 模型已输出完整回答
-      break
-    }
-
     if (outcome.finishReason === 'tool-calls') {
-      // task3 阶段暂不处理工具调用（task6 实现完整 ReAct 循环）
-      // 这里收到 tool-calls 说明传入了工具，但我们目前不传工具，
-      // 所以正常使用中不应该走到这个分支
-      callbacks.onError(new Error('[task3] tool-calls finishReason received — tool execution not yet implemented'))
-      break
+      // 有工具调用轮次 → 重置续写计数器（模型在取得进展，不是卡住了）
+      continuationAttempts = 0
+      let toolCalls: Awaited<StreamResult['toolCalls']>
+      try {
+        toolCalls = await outcome.result.toolCalls
+      } catch (err) {
+        if (isAbortError(err, options.abortSignal)) break
+        callbacks.onError(err instanceof Error ? err : new Error(String(err)))
+        break
+      }
+      await processToolCalls(toolCalls, state, options, callbacks)
+      // processToolCalls 在中断时会合成 tool_result，但接下来的 streamText 会立刻
+      // 以已中断的 signal 拒绝——直接 break 省掉这次无意义的请求。
+      if (options.abortSignal?.aborted) break
+      continue
     }
 
     if (outcome.finishReason === 'length') {
-      // 输出 token 耗尽 — task6 可扩展为自动续写（MAX_CONTINUATIONS 机制）
-      callbacks.onError(new Error('Response truncated: output token limit reached. Try a narrower question.'))
+      if (continuationAttempts < MAX_CONTINUATIONS) {
+        continuationAttempts++
+        // 续写提示进 state.messages 但不进 UI，用户看到的是连续的流式回答。
+        state.messages.push({
+          role: 'user',
+          content:
+            'Output token limit hit. Resume directly — no apology, no recap. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.',
+        })
+        continue
+      }
+      callbacks.onError(
+        new Error(
+          `Response still truncated after ${MAX_CONTINUATIONS} continuation attempts — ask a narrower question.`,
+        ),
+      )
       break
+    }
+
+    if (outcome.finishReason === 'stop') {
+      completedNormally = true
     }
 
     if (outcome.finishReason === 'content-filter') {
       callbacks.onError(new Error('Response stopped by the provider content filter.'))
-      break
     }
 
-    // 未知 finishReason — 安全退出，避免无限循环
     break
   }
 
-  // 超出 maxTurns 检查（仅在设置了上限时）
-  if (options.maxTurns !== undefined && turn >= options.maxTurns) {
+  // 超出 maxTurns（且非正常 stop）时报错
+  if (options.maxTurns !== undefined && turn >= options.maxTurns && !completedNormally) {
     callbacks.onError(new Error(`Reached maximum turns (${options.maxTurns}). Stopping agent loop.`))
   }
 

@@ -1,10 +1,19 @@
 // @mini-code-cli/core — Shared agent loop state
 //
-// 说明：这是 LoopState 的最小化版本，只保留 task3（单轮 streamText）所需的字段。
-// 后续 task 会逐步添加字段（如 recentToolCalls、todos、persistedMessageCount 等）。
+// 说明：这是 LoopState 的 task6 版本，在 task3 基础上新增了工具调用循环所需的字段：
+//   - recentToolCalls：Loop Guard 滑动窗口，用于检测死循环
+// 后续 task 会逐步添加字段（如 todos、persistedMessageCount 等）。
 import type { ModelMessage } from 'ai'
 
 import type { PermissionMode, TokenUsage } from '../types/index.js'
+
+// ── ToolCallRecord ────────────────────────────────────────────────────────────
+
+/** Loop Guard 记录的单次工具调用，保存名称和参数哈希（非原始输入，节省内存）。*/
+export interface ToolCallRecord {
+  toolName: string
+  hash: string
+}
 
 // LoopState 保存整个会话期间的可变状态。
 // agentLoop 在用户每次提交消息时接收 existingState 并原地修改，
@@ -30,6 +39,11 @@ export interface LoopState {
   systemPromptCache: string | null
   /** 当前权限模式 — 影响系统提示和可用工具集。*/
   permissionMode: PermissionMode
+  /** Loop Guard 滑动窗口。
+   *  记录最近 N 次工具调用的 { toolName, hash } 对，
+   *  用于检测模型是否在循环重复相同的调用。
+   *  task6 新增，由 loop-guard.ts 维护。*/
+  recentToolCalls: ToolCallRecord[]
 }
 
 // ── generateSessionId ────────────────────────────────────────────────────────
@@ -68,5 +82,6 @@ export function createLoopState(initialMode: PermissionMode = 'default'): LoopSt
     filesModified: new Set(),
     systemPromptCache: null,
     permissionMode: initialMode,
+    recentToolCalls: [],
   }
 }
