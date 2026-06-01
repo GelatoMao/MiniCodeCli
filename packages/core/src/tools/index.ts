@@ -10,9 +10,10 @@
 //     这些是只读、无副作用的安全操作，模型调用时无需人工确认。
 //
 //   手动分发（无 execute 函数，agent loop 收到 tool-call 后自行处理）：
-//     writeFile, edit
-//     这些是写操作，需要经过 checkPermission 权限检查，
+//     writeFile, edit, shell
+//     这些需要经过 checkPermission 权限检查，
 //     可能弹出交互式确认对话框等待用户决策。
+//     其中 shell 还需要跨平台 shell 选择和流式输出。
 //
 // 两类工具都被放入 toolRegistry，传给 streamText({ tools: toolRegistry }) 时：
 //   - auto-execute 工具由 AI SDK 在 fullStream 内部自动执行
@@ -23,6 +24,7 @@ import { glob } from './glob.js'
 import { grep } from './grep.js'
 import { listDir } from './list-dir.js'
 import { readFile } from './read-file.js'
+import { shell } from './shell.js'
 import { writeFile } from './write-file.js'
 
 /**
@@ -39,6 +41,7 @@ export const toolRegistry = {
   glob,
   grep,
   listDir,
+  shell,
 }
 
 // 单独导出各工具，方便按需引用（如 tool-execution.ts 中判断 tool 类型时使用）
@@ -49,6 +52,7 @@ export {
   glob,
   grep,
   listDir,
+  shell,
 }
 
 // 导出截断工具和相关常量，agent loop 在处理工具结果时使用
