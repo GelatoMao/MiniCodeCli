@@ -3,6 +3,7 @@
 // Task 9：接入 use-agent Hook，替换 Task 8 的临时模拟逻辑。
 // Task 10：完善 spinnerLabel 状态切换逻辑，利用 activeToolName + activeToolInput
 //          生成精确的工具运行提示（"Reading…" / "Writing…" / "Running…"）。
+// Task 12：实现 /model 斜杠命令，支持运行时切换模型。
 //
 // 主要变化：
 //   - 使用 useAgent() 管理 AgentState（messages、isLoading 等）
@@ -11,10 +12,18 @@
 //   - 工具调用状态通过 activeToolCalls Map 追踪
 //   - activeToolName / activeToolInput 驱动精确的 spinner 标签
 //   - 权限请求通过 pendingPermission 触发 UI（Task 10+ 完善对话框）
+//   - /model 命令：弹出可用 Provider 选择器，选后调用 switchModel
 import { useApp } from 'ink'
-import React, { useCallback, useEffect, useMemo } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 
 import type { AgentOptions, LanguageModel } from '@mini-code-cli/core'
+import {
+  PROVIDER_DETECTION_ORDER,
+  PROVIDER_KEY_URLS,
+  createModelRegistry,
+  getAvailableProviders,
+  resolveModelId,
+} from '@mini-code-cli/core'
 import { useAgent } from '../hooks/use-agent.js'
 import { ChatInput } from './ChatInput.js'
 
@@ -120,12 +129,141 @@ function buildToolSpinnerLabel(
   }
 }
 
+// ── /model 命令相关 ──────────────────────────────────────────────────────────
+
+/**
+ * 构建 /model 选择器的选项列表。
+ *
+ * 遍历 PROVIDER_DETECTION_ORDER，找到所有已配置 API Key 的 provider，
+ * 生成对应的默认模型选项。
+ *
+ * @returns Array of { modelId, label, description }
+ */
+function buildModelOptions(): Array<{ modelId: string; label: string; description: string }> {
+  const available = getAvailableProviders()
+  const options: Array<{ modelId: string; label: string; description: string }> = []
+
+  for (const { envKey, defaultModel } of PROVIDER_DETECTION_ORDER) {
+    const provider = defaultModel.split(':')[0]
+    if (!available.includes(provider)) continue
+
+    const keyUrl = PROVIDER_KEY_URLS[provider] ?? ''
+    const label = defaultModel
+    const description = keyUrl ? `Key: ${envKey}  ·  ${keyUrl}` : `Key: ${envKey}`
+    options.push({ modelId: defaultModel, label, description })
+  }
+
+  return options
+}
+
+// ── Model Picker 组件（简单内联实现）─────────────────────────────────────────
+
+interface ModelPickerState {
+  /** 当前选择的选项索引 */
+  selectedIndex: number
+  /** 可用选项列表 */
+  options: Array<{ modelId: string; label: string; description: string }>
+}
+
 // ── App ──────────────────────────────────────────────────────────────────────
 
 export function App({ model, options, initialPrompt }: AppProps): React.ReactElement {
   const { exit } = useApp()
 
-  const { state, submit, abort, resolvePermission, resolveQuestion } = useAgent(model, options)
+  const { state, submit: agentSubmit, abort, resolvePermission, resolveQuestion, switchModel } = useAgent(model, options)
+
+  // ── /model 命令状态 ───────────────────────────────────────────────────────────
+  // isModelPicking: 是否正在展示模型选择器
+  // modelPickerState: 选择器状态（选项列表 + 当前高亮索引）
+  const [isModelPicking, setIsModelPicking] = useState(false)
+  const [modelPickerState, setModelPickerState] = useState<ModelPickerState>({
+    selectedIndex: 0,
+    options: [],
+  })
+  // 记录当前选中的模型 ID（用于在 notice 中显示）
+  const [currentModelId, setCurrentModelId] = useState(options.modelId)
+
+  // ── 提交处理（拦截斜杠命令）────────────────────────────────────────────────────
+  const submit = useCallback((text: string) => {
+    const trimmed = text.trim()
+
+    // ─ /model 命令：弹出模型选择器 ──────────────────────────────────────────
+    if (trimmed === '/model' || trimmed.startsWith('/model ')) {
+      const modelOptions = buildModelOptions()
+      if (modelOptions.length === 0) {
+        // 无可用 provider（理论上不会到这里，因为 CLI 入口已检查）
+        return
+      }
+
+      // 打开选择器
+      setIsModelPicking(true)
+      setModelPickerState({
+        selectedIndex: 0,
+        options: modelOptions,
+      })
+      return
+    }
+
+    // 其他命令/普通消息：交给 agentLoop 处理
+    agentSubmit(text)
+  }, [agentSubmit])
+
+  // ── 模型选择器：键盘处理 ──────────────────────────────────────────────────────
+  // 通过 notice prop 展示选择器 UI，通过 handleModelPickerKey 处理上下/回车/Esc
+  const handleModelPickerKey = useCallback((key: 'up' | 'down' | 'enter' | 'escape') => {
+    if (!isModelPicking) return
+
+    if (key === 'up') {
+      setModelPickerState((prev) => {
+        const newIdx = (prev.selectedIndex - 1 + prev.options.length) % prev.options.length
+        return { ...prev, selectedIndex: newIdx }
+      })
+      return
+    }
+    if (key === 'down') {
+      setModelPickerState((prev) => {
+        const newIdx = (prev.selectedIndex + 1) % prev.options.length
+        return { ...prev, selectedIndex: newIdx }
+      })
+      return
+    }
+    if (key === 'enter') {
+      // 确认选择：读取当前状态，切换模型，关闭 picker
+      setModelPickerState((prev) => {
+        const selected = prev.options[prev.selectedIndex]
+        if (selected) {
+          // 重建 registry，获取新模型实例
+          const registry = createModelRegistry()
+          try {
+            const newModel = registry.languageModel(selected.modelId as `${string}:${string}`)
+            const resolvedId = resolveModelId(selected.modelId) ?? selected.modelId
+            switchModel(newModel, resolvedId)
+            setCurrentModelId(resolvedId)
+          } catch {
+            // 模型创建失败（provider 未注册）：静默处理
+          }
+        }
+        return prev
+      })
+      setIsModelPicking(false)
+      return
+    }
+    if (key === 'escape') {
+      setIsModelPicking(false)
+    }
+  }, [isModelPicking, switchModel])
+
+  // ── 构建模型选择器的 notice 文本 ───────────────────────────────────────────────
+  const modelPickerNotice = useMemo(() => {
+    if (!isModelPicking) return null
+    const { options: opts, selectedIndex } = modelPickerState
+    const lines = ['Select a model (↑↓ to move, Enter to confirm, Esc to cancel):']
+    opts.forEach((opt, i) => {
+      const cursor = i === selectedIndex ? '▶ ' : '  '
+      lines.push(`${cursor}${opt.label}`)
+    })
+    return lines.join('\n')
+  }, [isModelPicking, modelPickerState])
 
   // ── 初始 prompt 自动提交 ──────────────────────────────────────────────────────
   // 若启动时携带 initialPrompt（--print 模式或命令行直接传 prompt），
@@ -213,6 +351,11 @@ export function App({ model, options, initialPrompt }: AppProps): React.ReactEle
 
   // ── 中断处理 ──────────────────────────────────────────────────────────────────
   const handleInterrupt = useCallback(() => {
+    // 模型选择器打开时：Esc = 关闭选择器
+    if (isModelPicking) {
+      setIsModelPicking(false)
+      return
+    }
     if (state.isLoading) {
       // 有正在运行的请求 → 中断
       abort()
@@ -220,7 +363,16 @@ export function App({ model, options, initialPrompt }: AppProps): React.ReactEle
       // 没有运行中的请求 → 退出应用
       exit()
     }
-  }, [state.isLoading, abort, exit])
+  }, [state.isLoading, abort, exit, isModelPicking])
+
+  // ── 当前模型 notice ────────────────────────────────────────────────────────────
+  // 在非加载状态下，底部显示当前模型 ID（方便用户知道在用什么模型）
+  // 优先显示模型选择器 notice
+  const notice = modelPickerNotice ?? (
+    !state.isLoading && !isModelPicking
+      ? `Model: ${currentModelId}  · Type /model to switch`
+      : null
+  )
 
   return (
     <>
@@ -235,6 +387,9 @@ export function App({ model, options, initialPrompt }: AppProps): React.ReactEle
         streamingText={state.streamingText || null}
         disabled={state.isLoading && options.printMode}
         tokenUsage={state.tokenUsage.totalTokens > 0 ? state.tokenUsage : null}
+        notice={notice}
+        isModelPicking={isModelPicking}
+        onPickerNavKey={handleModelPickerKey}
       />
     </>
   )

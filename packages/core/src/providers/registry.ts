@@ -4,38 +4,267 @@
 //   1. 按环境变量中已配置的 API Key，懒注册对应的 AI SDK provider 实例
 //   2. 通过 permanentErrorFetch 拦截"永久失败"错误，将其状态码重写为
 //      非重试值，避免 SDK 对无法恢复的错误执行指数退避重试
+//   3. 通过 deepseekReasoningFetch 透传 DeepSeek 的思考过程数据
+//
+// 支持的 8 家厂商：
+//   anthropic（Claude）、openai（GPT/o 系列）、deepseek（DeepSeek V3/R1）、
+//   google（Gemini）、alibaba（通义千问）、xai（Grok）、zhipu（智谱 GLM）、
+//   moonshot（月之暗面 Kimi）
+//   + openai-compatible（自定义兼容端点）
 import { createAnthropic } from '@ai-sdk/anthropic'
+import { createAlibaba } from '@ai-sdk/alibaba'
 import { createDeepSeek } from '@ai-sdk/deepseek'
+import { createGoogleGenerativeAI } from '@ai-sdk/google'
 import { createOpenAI } from '@ai-sdk/openai'
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
+import { createXai } from '@ai-sdk/xai'
 import { createProviderRegistry } from 'ai'
 
 import { getProviderOptions } from '../config/index.js'
 
+// ─── Zhipu 和 Moonshot 使用 OpenAI 兼容协议 ──────────────────────────────
+//
+// 智谱 GLM 和月之暗面 Kimi 均提供 OpenAI 兼容 API，因此通过
+// createOpenAICompatible 接入，只需指定 baseURL 和 API Key 即可。
+//
+// 这也体现了"策略模式"：所有厂商面向统一接口，差异由工厂函数在初始化时注入。
+
+const ZHIPU_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4'
+const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1'
+
 /**
  * 创建 AI SDK Provider 注册表。
  *
- * 只有检测到对应环境变量（ANTHROPIC_API_KEY / OPENAI_API_KEY /
- * DEEPSEEK_API_KEY）时才注册该 provider，未配置的 provider 不出现在
+ * 只有检测到对应环境变量时才注册该 provider，未配置的 provider 不出现在
  * 注册表中。
  *
  * 返回的注册表通过 `registry.languageModel('provider:model-id')` 的
  * `<provider>:<model>` 格式统一寻址任意已注册的模型，例如：
  *   registry.languageModel('anthropic:claude-sonnet-4-5')
- *   registry.languageModel('openai:gpt-4.1')
+ *   registry.languageModel('deepseek:deepseek-reasoner')
+ *   registry.languageModel('xai:grok-beta')
  *
  * 每个 provider 都注入了 `permanentErrorFetch`，使永久性错误能被
  * 立即识别并短路，而不是被 SDK 反复重试。
+ * DeepSeek 额外叠加 `deepseekReasoningFetch`，确保思考内容字段正确传递。
  */
 export function createModelRegistry() {
   const opts = getProviderOptions()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const providers: Record<string, any> = {}
 
-  if (opts.anthropic) providers.anthropic = createAnthropic({ fetch: permanentErrorFetch })
-  if (opts.openai) providers.openai = createOpenAI({ fetch: permanentErrorFetch })
-  if (opts.deepseek) providers.deepseek = createDeepSeek({ fetch: permanentErrorFetch })
+  // ── 有独立 SDK 的厂商 ──────────────────────────────────────────────────
+  if (opts.anthropic) {
+    providers.anthropic = createAnthropic({
+      apiKey: opts.anthropic,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  if (opts.openai) {
+    providers.openai = createOpenAI({
+      apiKey: opts.openai,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  if (opts.deepseek) {
+    // DeepSeek 叠加两层 fetch：
+    //   permanentErrorFetch  — 永久错误短路
+    //   deepseekReasoningFetch — reasoning_content 字段透传（最外层）
+    // 调用顺序：deepseekReasoningFetch → permanentErrorFetch → fetch
+    providers.deepseek = createDeepSeek({
+      apiKey: opts.deepseek,
+      fetch: deepseekReasoningFetch(permanentErrorFetch),
+    })
+  }
+
+  if (opts.google) {
+    providers.google = createGoogleGenerativeAI({
+      apiKey: opts.google,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  if (opts.alibaba) {
+    providers.alibaba = createAlibaba({
+      apiKey: opts.alibaba,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  if (opts.xai) {
+    providers.xai = createXai({
+      apiKey: opts.xai,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  // ── 使用 OpenAI 兼容协议的厂商 ────────────────────────────────────────
+  if (opts.zhipu) {
+    providers.zhipu = createOpenAICompatible({
+      name: 'zhipu',
+      apiKey: opts.zhipu,
+      baseURL: ZHIPU_BASE_URL,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  if (opts.moonshot) {
+    providers.moonshot = createOpenAICompatible({
+      name: 'moonshot',
+      apiKey: opts.moonshot,
+      baseURL: MOONSHOT_BASE_URL,
+      fetch: permanentErrorFetch,
+    })
+  }
+
+  // ── 自定义 OpenAI 兼容端点 ───────────────────────────────────────────
+  // 通过 OPENAI_COMPATIBLE_API_KEY + OPENAI_COMPATIBLE_BASE_URL 配置。
+  if (opts.openaiCompatible?.apiKey && opts.openaiCompatible.baseURL) {
+    providers['openai-compatible'] = createOpenAICompatible({
+      name: 'openai-compatible',
+      apiKey: opts.openaiCompatible.apiKey,
+      baseURL: opts.openaiCompatible.baseURL,
+      fetch: permanentErrorFetch,
+    })
+  }
 
   return createProviderRegistry(providers)
+}
+
+// ── deepseekReasoningFetch ─────────────────────────────────────────────────
+//
+// 背景：DeepSeek R1（deepseek-reasoner）的 API 响应中包含 `reasoning_content`
+// 字段，里面存放模型的思维链（Chain of Thought）。AI SDK 标准接口不认识
+// 这个字段，如果不做处理，思考内容会被直接丢弃，无法在 UI 中展示。
+//
+// 解决方案：在 SSE 流到达 AI SDK 解析器之前，对每一行 SSE 数据进行改写：
+//   1. 找到含有 "reasoning_content" 的 SSE data 行
+//   2. 将 reasoning_content 字段的内容转换为普通文本增量（text delta）
+//      的格式（追加到 content.delta 中），让 AI SDK 能正常处理
+//
+// 这是一种"透明代理"模式：外层函数接收另一个 fetch，返回经过改写的响应，
+// 调用者无需关心内部差异。
+
+/**
+ * DeepSeek Reasoning 内容透传 fetch 包装器工厂。
+ *
+ * 接受一个底层 fetch（通常是 permanentErrorFetch），返回一个新的 fetch 函数。
+ * 该函数在 SSE 流中检测到 `reasoning_content` 字段时，将其内容以统一的
+ * `<think>...</think>` 标记格式注入到普通文本流中，使思考过程在 UI 可见。
+ *
+ * @param innerFetch 底层 fetch 实现（通常为 permanentErrorFetch）
+ */
+export function deepseekReasoningFetch(innerFetch: typeof fetch): typeof fetch {
+  return async (input, init) => {
+    const response = await innerFetch(input, init)
+
+    // 只处理 SSE 流式响应（text/event-stream）
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/event-stream') || !response.body) {
+      return response
+    }
+
+    // 将原始 ReadableStream 转换，对每行 SSE data 进行 reasoning_content 处理
+    const transformedBody = transformDeepSeekStream(response.body)
+
+    return new Response(transformedBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    })
+  }
+}
+
+/**
+ * 对 DeepSeek SSE 流进行逐行转换。
+ *
+ * 针对每一行包含 JSON data 的 SSE 行：
+ * - 如果 delta 中有 reasoning_content，将其以 <think> 标记格式追加到 content
+ * - 原始 content delta 保持不变，reasoning_content 追加在其后
+ *
+ * 格式约定（与 Claude 的 thinking 对齐）：
+ *   首次 reasoning_content → 追加 "<think>\n" + content
+ *   后续 reasoning_content → 直接追加
+ *   reasoning_content 结束（普通 content 出现）→ 追加 "\n</think>\n"
+ */
+function transformDeepSeekStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let inReasoning = false
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = body.getReader()
+      let buffer = ''
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() ?? '' // 最后一行可能不完整，保留到下次
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) {
+              // 非 data 行（空行、event: 行等）原样透传
+              controller.enqueue(encoder.encode(line + '\n'))
+              continue
+            }
+
+            const dataStr = line.slice(6) // 去掉 "data: " 前缀
+            if (dataStr === '[DONE]') {
+              controller.enqueue(encoder.encode(line + '\n'))
+              continue
+            }
+
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const parsed: any = JSON.parse(dataStr)
+              const delta = parsed?.choices?.[0]?.delta
+
+              if (delta && typeof delta === 'object') {
+                const reasoningContent: string | undefined = delta.reasoning_content
+                const textContent: string | undefined = delta.content
+
+                if (reasoningContent) {
+                  // 有思考内容：加上 <think> 包裹标记
+                  if (!inReasoning) {
+                    // 进入思考阶段：注入开始标记
+                    inReasoning = true
+                    delta.content = '<think>\n' + reasoningContent
+                  } else {
+                    delta.content = reasoningContent
+                  }
+                  delete delta.reasoning_content
+                } else if (textContent !== undefined && textContent !== null && inReasoning) {
+                  // 思考阶段结束，有普通文本：注入结束标记
+                  inReasoning = false
+                  delta.content = '\n</think>\n' + textContent
+                }
+              }
+
+              controller.enqueue(encoder.encode('data: ' + JSON.stringify(parsed) + '\n'))
+            } catch {
+              // JSON 解析失败（非预期数据）：原样透传
+              controller.enqueue(encoder.encode(line + '\n'))
+            }
+          }
+        }
+
+        // 处理 buffer 中剩余的内容（不完整行）
+        if (buffer) {
+          controller.enqueue(encoder.encode(buffer))
+        }
+      } finally {
+        controller.close()
+        reader.releaseLock()
+      }
+    },
+  })
 }
 
 // ── permanentErrorFetch ────────────────────────────────────────────────────

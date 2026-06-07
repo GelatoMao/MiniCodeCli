@@ -77,6 +77,16 @@ export interface ChatInputProps {
    * 显示在分隔线右侧：input/output/cache read/context%
    */
   tokenUsage?: TokenUsage | null
+  /**
+   * 是否处于模型选择器模式（Task 12）。
+   * 为 true 时，上下键和回车键路由到 onPickerNavKey，不更新输入框。
+   */
+  isModelPicking?: boolean
+  /**
+   * 模型选择器导航键回调（Task 12）。
+   * 接收 'up' | 'down' | 'enter' | 'escape'。
+   */
+  onPickerNavKey?: (key: 'up' | 'down' | 'enter' | 'escape') => void
 }
 
 // ── 辅助：构建输入行 cells ─────────────────────────────────────────────────
@@ -367,6 +377,8 @@ export function ChatInput({
   spinnerLabel,
   streamingText,
   tokenUsage,
+  isModelPicking = false,
+  onPickerNavKey,
 }: ChatInputProps): null {
   const [{ text, cursor }, dispatch] = useReducer(inputReducer, { text: '', cursor: 0 } as InputState)
   const cursorRef = useRef(0)
@@ -543,6 +555,17 @@ export function ChatInput({
       dispatch({ type: 'INSERT', pos: cursorRef.current, chunk: content })
     },
     onKey: (key) => {
+      // ── 模型选择器模式：上下键/回车/Esc 路由到 picker，其他键忽略 ──────────
+      if (isModelPicking && onPickerNavKey) {
+        if (key === 'up' || key === 'down' || key === 'return' || key === 'escape') {
+          const pickerKey = key === 'return' ? 'enter' : key as 'up' | 'down' | 'escape'
+          onPickerNavKey(pickerKey)
+          return
+        }
+        // 其他键在 picker 模式下忽略（避免误操作）
+        return
+      }
+
       switch (key) {
         case 'return': {
           if (isLoading) return

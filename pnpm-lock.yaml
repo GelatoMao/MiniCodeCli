@@ -62,6 +62,9 @@ importers:
 
   packages/core:
     dependencies:
+      '@ai-sdk/alibaba':
+        specifier: ^1.0.26
+        version: 1.0.26(zod@3.25.76)
       '@ai-sdk/anthropic':
         specifier: ^3.0.0
         version: 3.0.81(zod@3.25.76)
@@ -77,6 +80,9 @@ importers:
       '@ai-sdk/openai-compatible':
         specifier: ^2.0.0
         version: 2.0.48(zod@3.25.76)
+      '@ai-sdk/xai':
+        specifier: ^3.0.93
+        version: 3.0.93(zod@3.25.76)
       '@vscode/ripgrep':
         specifier: ^1.17.0
         version: 1.18.0
@@ -94,6 +100,12 @@ importers:
         version: 3.25.76
 
 packages:
+
+  '@ai-sdk/alibaba@1.0.26':
+    resolution: {integrity: sha512-8j4QPWKDTraUlXh3+6AotaLA4CewOdLMBCtk8SATWpjwSSCfrUS8ExGEuwNSXx1eLIDiGVjwIb+hbtZL1e6fLw==, tarball: https://registry.npmjs.org/@ai-sdk/alibaba/-/alibaba-1.0.26.tgz}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
 
   '@ai-sdk/anthropic@3.0.81':
     resolution: {integrity: sha1-lYCn+6blxSX+r+lKiFwIX/fUWu4=, tarball: http://r.npm.sankuai.com/@ai-sdk/anthropic/download/@ai-sdk/anthropic-3.0.81.tgz}
@@ -140,6 +152,12 @@ packages:
   '@ai-sdk/provider@3.0.10':
     resolution: {integrity: sha1-q/tndvaZlR+bisIM8dQqP8fXl1I=, tarball: http://r.npm.sankuai.com/@ai-sdk/provider/download/@ai-sdk/provider-3.0.10.tgz}
     engines: {node: '>=18'}
+
+  '@ai-sdk/xai@3.0.93':
+    resolution: {integrity: sha1-R77E+MAttwBHOpdeEtn7/tafqK4=, tarball: http://r.npm.sankuai.com/@ai-sdk/xai/download/@ai-sdk/xai-3.0.93.tgz}
+    engines: {node: '>=18'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
 
   '@babel/code-frame@7.29.7':
     resolution: {integrity: sha1-8vu/6ofESiFZDsUVt3iywm2IZuc=, tarball: http://r.npm.sankuai.com/@babel/code-frame/download/@babel/code-frame-7.29.7.tgz}
@@ -1587,6 +1605,13 @@ packages:
 
 snapshots:
 
+  '@ai-sdk/alibaba@1.0.26(zod@3.25.76)':
+    dependencies:
+      '@ai-sdk/openai-compatible': 2.0.48(zod@3.25.76)
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.27(zod@3.25.76)
+      zod: 3.25.76
+
   '@ai-sdk/anthropic@3.0.81(zod@3.25.76)':
     dependencies:
       '@ai-sdk/provider': 3.0.10
@@ -1634,6 +1659,13 @@ snapshots:
   '@ai-sdk/provider@3.0.10':
     dependencies:
       json-schema: 0.4.0
+
+  '@ai-sdk/xai@3.0.93(zod@3.25.76)':
+    dependencies:
+      '@ai-sdk/openai-compatible': 2.0.48(zod@3.25.76)
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.27(zod@3.25.76)
+      zod: 3.25.76
 
   '@babel/code-frame@7.29.7':
     dependencies:

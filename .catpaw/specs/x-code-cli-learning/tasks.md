@@ -148,7 +148,7 @@
 
 ## 阶段五：进阶 AI 特性
 
-- [ ] 12. 多 Provider 支持 + /model 命令
+- [x] 12. 多 Provider 支持 + /model 命令
   - 在 `registry.ts` 中补全 8 家厂商：OpenAI、DeepSeek（含 `deepseekReasoningFetch`）、Google、Alibaba、xAI、Zhipu、MoonshotAI
   - 实现 `PROVIDER_DETECTION_ORDER` 和 fallback 逻辑
   - 实现 `getEnvVarName(provider)`、`PROVIDER_KEY_URLS`
