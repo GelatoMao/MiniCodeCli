@@ -1,13 +1,18 @@
 // @mini-code-cli/core — 工具执行与调度
 //
 // 负责处理 agentLoop 收到 finishReason === 'tool-calls' 后的全部逻辑：
-//   1. 区分"自动执行工具"（readFile/glob/grep/listDir）和"手动分发工具"（writeFile/edit/shell）
+//   1. 区分"自动执行工具"（readFile/glob/grep/listDir）和"手动分发工具"（writeFile/edit/shell/task）
 //   2. 对手动工具依次执行：Loop Guard → 权限检查 → 实际执行 → 推送结果
 //   3. 把工具结果消息写入 state.messages，让下一轮 streamText 能看到结果
 //
+// task15 新增：
+//   - handleTaskTool：task 工具处理器，委托给 runSubAgent 执行子 agentLoop
+//   - processToolCalls 新增参数 effectiveTools，传给 handleTaskTool 进行工具白名单过滤
+//   - task 工具被放入 BYPASS_LOOP_GUARD_HANDLERS（绕过循环守卫，有独立的并行批处理）
+//
 // 主要导出：
 //   processToolCalls  — 处理单轮模型输出的所有工具调用
-//   partitionToolCalls — 将 task 工具的连续调用分批（task6 无 task 工具，但保留结构）
+//   partitionToolCalls — 将 task 工具的连续调用分批（并行执行）
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -21,6 +26,7 @@ import type { AgentCallbacks, AgentOptions } from '../types/index.js'
 import { checkForLoop, recordToolCall } from './loop-guard.js'
 import type { LoopState } from './loop-state.js'
 import { isToolErrorString, toolErrorFromUnknown, toolErrorString, toolResultMessage } from './messages.js'
+// (SubAgentRegistry type is used implicitly via dynamic imports in handleTaskTool)
 
 // ── isAbortError ──────────────────────────────────────────────────────────────
 
@@ -199,6 +205,9 @@ interface HandlerCtx {
   state: LoopState
   options: AgentOptions
   callbacks: AgentCallbacks
+  /** task15 新增：当前 session 的完整工具集（用于 task 工具的白名单过滤）*/
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  effectiveTools: Record<string, any>
 }
 
 // ── handleAskUser ─────────────────────────────────────────────────────────────
@@ -215,15 +224,98 @@ async function handleAskUser(ctx: HandlerCtx): Promise<void> {
   pushToolResult(state, callbacks, toolCallId, toolName, `User answered: ${answer}`)
 }
 
+// ── handleTaskTool ─────────────────────────────────────────────────────────────
+
+/** task 工具处理器（task15 新增）。
+ *
+ *  将子任务委托给独立的 sub-agent 运行。
+ *
+ *  绕过循环守卫的理由：
+ *    - task 工具的每次调用通常对应不同的子任务（不同 prompt），
+ *      但 hash 可能相同（例如"探索目录"类的通用任务）。
+ *    - 循环守卫会误杀合法的并行 task 调用。
+ *    - task 工具有自己的安全边界（sub-agent 不能再调用 task），
+ *      递归问题不需要循环守卫来处理。
+ *
+ *  绕过权限检查的理由：
+ *    - task 工具本身是只读操作（委托调用）；实际的写操作在子 agentLoop 内部
+ *      单独经过权限检查，不需要在父 agent 重复。
+ */
+async function handleTaskTool(ctx: HandlerCtx): Promise<void> {
+  const { input, toolCallId, toolName, state, options, callbacks, effectiveTools } = ctx
+
+  const subagentName = input.subagent as string
+  const prompt = input.prompt as string
+
+  // 动态 import 避免循环依赖（runner.ts → loop.ts → tool-execution.ts → runner.ts）
+  const { runSubAgent } = await import('./sub-agents/runner.js')
+  const { createSubAgentRegistry } = await import('./sub-agents/registry.js')
+
+  // 从注册表中查找 sub-agent 定义
+  const registry = await createSubAgentRegistry()
+  const def = registry.get(subagentName)
+
+  if (!def) {
+    pushToolResult(
+      state,
+      callbacks,
+      toolCallId,
+      toolName,
+      `Error: Unknown sub-agent "${subagentName}". Available: ${registry.list().map((a) => a.name).join(', ')}`,
+      true,
+    )
+    return
+  }
+
+  // 通知 UI：task 工具正在执行（显示 sub-agent 名称）
+  reportProgress(toolCallId, `Running ${subagentName} sub-agent...`)
+
+  let result: Awaited<ReturnType<typeof runSubAgent>>
+  try {
+    result = await runSubAgent(
+      def,
+      prompt,
+      // model 不在 ctx 里，通过 options 的 modelRegistry 获取
+      // 注意：这里需要从外部传入 model，因为 HandlerCtx 没有 model 字段
+      // 临时方案：通过 options 里的 modelRegistry 重建
+      options.modelRegistry!.languageModel(options.modelId),
+      options,
+      callbacks,
+      state,
+      effectiveTools,
+    )
+  } catch (err) {
+    pushToolResult(
+      state,
+      callbacks,
+      toolCallId,
+      toolName,
+      `Error: Sub-agent "${subagentName}" failed: ${err instanceof Error ? err.message : String(err)}`,
+      true,
+    )
+    return
+  }
+
+  pushToolResult(
+    state,
+    callbacks,
+    toolCallId,
+    toolName,
+    result.output,
+    false,
+  )
+}
+
 // ── BYPASS_LOOP_GUARD_HANDLERS ────────────────────────────────────────────────
 
 type ToolHandler = (ctx: HandlerCtx) => Promise<void>
 
 /** 绕过循环守卫和 writeFile/edit/shell 权限+执行管道的特殊工具。
  *  每个处理器负责自己调用 pushToolResult。
- *  task6 只有 askUser；task15 会加 task。*/
+ *  task6 只有 askUser；task15 新增 task。*/
 const BYPASS_LOOP_GUARD_HANDLERS: Record<string, ToolHandler> = {
   askUser: handleAskUser,
+  task: handleTaskTool,
 }
 
 // ── applyLoopGuard ────────────────────────────────────────────────────────────
@@ -339,6 +431,8 @@ async function handleToolCall(
   options: AgentOptions,
   callbacks: AgentCallbacks,
   deferred: ModelMessage[],
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  effectiveTools: Record<string, any>,
 ): Promise<void> {
   const ctx: HandlerCtx = {
     toolName: tc.toolName,
@@ -347,6 +441,7 @@ async function handleToolCall(
     state,
     options,
     callbacks,
+    effectiveTools,
   }
 
   // 先尝试 bypass 路由（askUser 等特殊工具绕过循环守卫）
@@ -456,6 +551,8 @@ export async function processToolCalls(
   state: LoopState,
   options: AgentOptions,
   callbacks: AgentCallbacks,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  effectiveTools: Record<string, any> = {},
 ): Promise<void> {
   const activeIds = collectActiveAssistantToolCallIds(state)
   const fulfilledIds = collectFulfilledToolCallIds(state)
@@ -504,7 +601,7 @@ export async function processToolCalls(
       break
     }
 
-    await Promise.all(batch.map((tc) => handleToolCall(tc, state, options, callbacks, deferred)))
+    await Promise.all(batch.map((tc) => handleToolCall(tc, state, options, callbacks, deferred, effectiveTools)))
     dispatched += batch.length
   }
 

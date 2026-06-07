@@ -196,6 +196,8 @@ async function main() {
     printMode: argv.print,
     maxTurns: argv['max-turns'],
     permissionMode: argv.plan ? 'plan' : 'default',
+    // task 工具（sub-agent）需要通过 modelRegistry 重建 LanguageModel 实例
+    modelRegistry: providerRegistry,
   }
 
   // 启动 Ink 应用 — waitUntilExit 在 Ink 卸载时 resolve（包括 Ctrl+C）

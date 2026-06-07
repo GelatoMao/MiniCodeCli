@@ -20,6 +20,13 @@
 //   - 正常 stop 后调用 appendUsage（写 usage 快照，便于后续会话统计）
 //   - agentLoop 新增 cwd 参数传递给 session-store
 //
+// task15 新增：
+//   - buildTools 接受可选的 toolsOverride 参数
+//     - toolsOverride 非空时直接使用（sub-agent 场景：工具已过滤，不含 task 工具）
+//     - toolsOverride 为空时重新构建（主 agent：toolRegistry + task 工具）
+//   - agentLoop 新增可选参数 toolsOverride（runner.ts 通过此参数注入子工具集）
+//   - 主 agent 的 buildTools 通过 createSubAgentRegistry 构建 task 工具并注入
+//
 // 核心函数调用链：
 //   agentLoop
 //     └─ while loop
@@ -39,12 +46,14 @@ import type { LanguageModel, UserContent } from 'ai'
 
 import { applyCacheControl } from '../providers/cache-control.js'
 import { toolRegistry, truncateToolResult } from '../tools/index.js'
+import { createTaskTool } from '../tools/task.js'
 import { clearProgressReporter, setProgressReporter } from '../tools/progress.js'
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
 import { createLoopState } from './loop-state.js'
 import type { LoopState } from './loop-state.js'
 import { checkAndCompressContext } from './compression.js'
 import { flushPendingMessages, appendUsage } from './session-store.js'
+import { createSubAgentRegistry } from './sub-agents/registry.js'
 import { drainStreamResult } from './stream-utils.js'
 import type { StreamResult } from './stream-utils.js'
 import { processToolCalls } from './tool-execution.js'
@@ -74,15 +83,41 @@ export interface AgentLoopResult {
 /** 构建本次 session 的工具集。
  *
  *  task6 阶段：返回静态 toolRegistry（readFile/writeFile/edit/glob/grep/listDir/shell）。
- *  task15 会在这里动态注入 task 工具（sub-agent）。
+ *
+ *  task15 新增：
+ *    - 如果传入 toolsOverride（sub-agent 场景），直接返回它（已由 runner.ts 过滤过）
+ *    - 否则构建完整工具集：toolRegistry + task 工具（sub-agent 委托）
+ *    - task 工具通过 createSubAgentRegistry 动态构建，包含所有可用 sub-agent 的描述
+ *
  *  task16 会注入 MCP 工具。
  *
  *  - 有 execute 的工具（readFile/glob/grep/listDir）：AI SDK 在 fullStream 内部自动执行
- *  - 无 execute 的工具（writeFile/edit/shell）：产出 tool-call chunk，
- *    由 agentLoop 在 finishReason='tool-calls' 时调用 processToolCalls 手动处理*/
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function buildTools(_options: AgentOptions): Record<string, any> {
-  return { ...toolRegistry }
+ *  - 无 execute 的工具（writeFile/edit/shell/task）：产出 tool-call chunk，
+ *    由 agentLoop 在 finishReason='tool-calls' 时调用 processToolCalls 手动处理
+ *
+ *  @param _options    AgentOptions（预留，task16 MCP 注入时会用到）
+ *  @param cwd         当前工作目录（用于加载项目级自定义 sub-agent）
+ *  @param toolsOverride 如果非 null，直接返回它（用于 sub-agent 工具过滤）*/
+async function buildTools(
+  _options: AgentOptions,
+  cwd?: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  toolsOverride?: Record<string, any> | null,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<Record<string, any>> {
+  // sub-agent 场景：工具集已由 runner.ts 过滤，直接使用
+  if (toolsOverride != null) {
+    return toolsOverride
+  }
+
+  // 主 agent 场景：构建完整工具集（静态工具 + task 工具）
+  const registry = await createSubAgentRegistry(cwd)
+  const taskTool = createTaskTool(registry)
+
+  return {
+    ...toolRegistry,
+    task: taskTool,
+  }
 }
 
 // ── streamChunksToUI ─────────────────────────────────────────────────────────
@@ -293,12 +328,18 @@ async function runTurn(
  *    - flushPendingMessages 后 checkAndCompressContext（context 压缩）
  *    - 正常 stop 后 appendUsage（写 token usage 快照）
  *
- *  @param userMessage 用户输入（字符串或多模态内容）
- *  @param model       AI SDK LanguageModel 实例（由 registry.languageModel() 创建）
- *  @param options     运行选项（modelId、trustMode、abortSignal 等）
- *  @param callbacks   UI 回调（onTextDelta、onToolCall 等）
- *  @param existingState 可选：从上一次 agentLoop 调用延续的 state（多轮对话）
- *  @param cwd         工作目录（默认 process.cwd()），传给 session-store
+ *  task15 新增：
+ *    - 新增可选参数 toolsOverride：sub-agent 通过此参数传入过滤后的工具集
+ *    - 主 agent 调用时不传 toolsOverride，由 buildTools 构建完整工具集（含 task 工具）
+ *    - processToolCalls 需要访问 effectiveTools 来处理 task 工具调用
+ *
+ *  @param userMessage    用户输入（字符串或多模态内容）
+ *  @param model          AI SDK LanguageModel 实例（由 registry.languageModel() 创建）
+ *  @param options        运行选项（modelId、trustMode、abortSignal 等）
+ *  @param callbacks      UI 回调（onTextDelta、onToolCall 等）
+ *  @param existingState  可选：从上一次 agentLoop 调用延续的 state（多轮对话）
+ *  @param cwd            工作目录（默认 process.cwd()），传给 session-store
+ *  @param toolsOverride  可选：直接使用的工具集（sub-agent 场景，跳过 buildTools 构建）
  */
 export async function agentLoop(
   userMessage: UserContent,
@@ -307,6 +348,8 @@ export async function agentLoop(
   callbacks: AgentCallbacks,
   existingState?: LoopState,
   cwd?: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  toolsOverride?: Record<string, any> | null,
 ): Promise<AgentLoopResult> {
   const state = existingState ?? createLoopState(options.permissionMode ?? 'default')
 
@@ -321,7 +364,8 @@ export async function agentLoop(
     "You are a helpful AI assistant. Respond concisely and accurately to the user's questions."
 
   // 构建工具集（本次 session 内稳定，不需要每轮重建）
-  const effectiveTools = buildTools(options)
+  // task15：如果传入 toolsOverride（sub-agent 场景），buildTools 直接返回它
+  const effectiveTools = await buildTools(options, cwd, toolsOverride)
 
   // 自动续写：finishReason === 'length' 时推入续写提示，最多续写 MAX_CONTINUATIONS 次。
   // 推理模型在输出 token 不足前有时会截断回答——
@@ -373,7 +417,7 @@ export async function agentLoop(
         callbacks.onError(err instanceof Error ? err : new Error(String(err)))
         break
       }
-      await processToolCalls(toolCalls, state, options, callbacks)
+      await processToolCalls(toolCalls, state, options, callbacks, effectiveTools)
       // processToolCalls 在中断时会合成 tool_result，但接下来的 streamText 会立刻
       // 以已中断的 signal 拒绝——直接 break 省掉这次无意义的请求。
       if (options.abortSignal?.aborted) break
