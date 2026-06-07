@@ -8,12 +8,19 @@
 //   - collectTurnResponse 里调用 truncateToolResultsInMessages（auto-execute 结果截断）
 //   - 在 streamChunksToUI 里注册 progress reporter（setProgressReporter）
 //
+// task13 新增：
+//   - runTurn 中调用 applyCacheControl()，在发送给 API 前注入 Prompt Caching 标记
+//   - Anthropic：在系统提示和末尾 3 条消息注入 cache_control: { type: 'ephemeral' }
+//   - OpenAI：通过 promptCacheKey 设置前缀缓存 key
+//   - 其他 provider：不作修改，依赖字节稳定的系统提示隐式触发 prefix cache
+//
 // 核心函数调用链：
 //   agentLoop
 //     └─ while loop
 //           ├─ runTurn
 //           │     ├─ repairOrphanToolCalls（防御性修复）
-//           │     ├─ streamText（传 tools）
+//           │     ├─ applyCacheControl（task13：注入缓存断点）
+//           │     ├─ streamText（传 system / messages / tools）
 //           │     ├─ streamChunksToUI（含 progress reporter 注册）
 //           │     └─ collectTurnResponse（含 truncateToolResultsInMessages）
 //           ├─ 'stop'    → break（正常结束）
@@ -22,6 +29,7 @@
 import { streamText } from 'ai'
 import type { LanguageModel, UserContent } from 'ai'
 
+import { applyCacheControl } from '../providers/cache-control.js'
 import { toolRegistry, truncateToolResult } from '../tools/index.js'
 import { clearProgressReporter, setProgressReporter } from '../tools/progress.js'
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
@@ -186,7 +194,14 @@ function isAbortError(err: unknown, signal: AbortSignal | undefined): boolean {
  *
  *  task6 相比 task3 的变化：
  *    1. 接受 effectiveTools 参数并传给 streamText
- *    2. 在调用 streamText 前执行 repairOrphanToolCalls（防御性修复）*/
+ *    2. 在调用 streamText 前执行 repairOrphanToolCalls（防御性修复）
+ *
+ *  task13 新增：
+ *    3. 调用 applyCacheControl 为 Anthropic / OpenAI 注入 Prompt Caching 标记
+ *       - Anthropic：系统提示 + 末尾 3 条消息注入 cache_control
+ *       - OpenAI：系统提示注入 promptCacheKey
+ *       - 其他：不修改，依赖字节稳定的前缀缓存自动命中
+ *    4. 将 system 由字符串改为传 SystemModelMessage 对象，以携带 providerOptions*/
 async function runTurn(
   state: LoopState,
   model: LanguageModel,
@@ -201,12 +216,24 @@ async function runTurn(
   // 且未产生配对 result），这里会合成一条错误 result，防止 422。
   repairOrphanToolCalls(state.messages)
 
+  // task13：注入 Prompt Caching 控制标记。
+  // 返回的 systemMessage 和 cachedMessages 是带有 providerOptions 的新对象，
+  // 不修改 state.messages（state 中保留原始消息，避免重复叠加断点）。
+  const { systemMessage, messages: cachedMessages } = applyCacheControl(
+    options.modelId,
+    systemPrompt,
+    state.messages,
+    state.sessionId,
+  )
+
   let result: StreamResult
   try {
     result = streamText({
       model,
-      system: systemPrompt,
-      messages: state.messages,
+      // system 字段接受字符串或 SystemModelMessage，这里传对象以携带 providerOptions
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      system: systemMessage as any,
+      messages: cachedMessages,
       tools: effectiveTools,
       maxRetries: 3,
       abortSignal: options.abortSignal,
