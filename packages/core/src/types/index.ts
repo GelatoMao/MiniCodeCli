@@ -34,6 +34,10 @@ export interface AgentCallbacks {
   onShellOutput: (chunk: string) => void
   onUsageUpdate: (usage: TokenUsage) => void
   onError: (error: Error) => void
+  /** Context 压缩完成回调（task14 新增）。
+   *  当 context 超过阈值触发 LLM 摘要压缩后，通知 UI 清空/刷新消息展示区。
+   *  可选字段：不提供时静默压缩，不通知 UI。*/
+  onContextCompressed?: () => void
 }
 
 // ─── Agent options ───

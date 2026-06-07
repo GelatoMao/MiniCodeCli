@@ -14,16 +14,24 @@
 //   - OpenAI：通过 promptCacheKey 设置前缀缓存 key
 //   - 其他 provider：不作修改，依赖字节稳定的系统提示隐式触发 prefix cache
 //
+// task14 新增：
+//   - 主循环每轮开始前调用 flushPendingMessages（增量写 JSONL，crash-safe 持久化）
+//   - flushPendingMessages 之后调用 checkAndCompressContext（context 压缩，tokens 超限时触发）
+//   - 正常 stop 后调用 appendUsage（写 usage 快照，便于后续会话统计）
+//   - agentLoop 新增 cwd 参数传递给 session-store
+//
 // 核心函数调用链：
 //   agentLoop
 //     └─ while loop
+//           ├─ flushPendingMessages（task14：增量写 JSONL）
+//           ├─ checkAndCompressContext（task14：context 压缩）
 //           ├─ runTurn
 //           │     ├─ repairOrphanToolCalls（防御性修复）
 //           │     ├─ applyCacheControl（task13：注入缓存断点）
 //           │     ├─ streamText（传 system / messages / tools）
 //           │     ├─ streamChunksToUI（含 progress reporter 注册）
 //           │     └─ collectTurnResponse（含 truncateToolResultsInMessages）
-//           ├─ 'stop'    → break（正常结束）
+//           ├─ 'stop'    → appendUsage → break（正常结束）
 //           ├─ 'tool-calls' → processToolCalls → continue（ReAct 循环）
 //           └─ 'length'  → push 续写提示 → continue（最多 3 次）
 import { streamText } from 'ai'
@@ -35,6 +43,8 @@ import { clearProgressReporter, setProgressReporter } from '../tools/progress.js
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
 import { createLoopState } from './loop-state.js'
 import type { LoopState } from './loop-state.js'
+import { checkAndCompressContext } from './compression.js'
+import { flushPendingMessages, appendUsage } from './session-store.js'
 import { drainStreamResult } from './stream-utils.js'
 import type { StreamResult } from './stream-utils.js'
 import { processToolCalls } from './tool-execution.js'
@@ -278,11 +288,17 @@ async function runTurn(
  *    - finishReason === 'length' → 推入续写提示，最多 MAX_CONTINUATIONS 次
  *    - 循环守卫（loop-guard.ts）防止模型陷入死循环
  *
+ *  task14 新增：
+ *    - 每轮开始前 flushPendingMessages（增量 JSONL 持久化）
+ *    - flushPendingMessages 后 checkAndCompressContext（context 压缩）
+ *    - 正常 stop 后 appendUsage（写 token usage 快照）
+ *
  *  @param userMessage 用户输入（字符串或多模态内容）
  *  @param model       AI SDK LanguageModel 实例（由 registry.languageModel() 创建）
  *  @param options     运行选项（modelId、trustMode、abortSignal 等）
  *  @param callbacks   UI 回调（onTextDelta、onToolCall 等）
  *  @param existingState 可选：从上一次 agentLoop 调用延续的 state（多轮对话）
+ *  @param cwd         工作目录（默认 process.cwd()），传给 session-store
  */
 export async function agentLoop(
   userMessage: UserContent,
@@ -290,6 +306,7 @@ export async function agentLoop(
   options: AgentOptions,
   callbacks: AgentCallbacks,
   existingState?: LoopState,
+  cwd?: string,
 ): Promise<AgentLoopResult> {
   const state = existingState ?? createLoopState(options.permissionMode ?? 'default')
 
@@ -316,6 +333,29 @@ export async function agentLoop(
 
   while (options.maxTurns === undefined || turn < options.maxTurns) {
     turn++
+
+    // ── task14：增量持久化 ──────────────────────────────────────────────────
+    // 在每轮 runTurn 之前先把新消息写入 JSONL 文件。
+    // 这样即使程序崩溃，已处理的消息也不会丢失（crash-safe）。
+    // flushPendingMessages 是幂等的，第二次调用只追加新增部分。
+    try {
+      flushPendingMessages(state, options.modelId, cwd)
+    } catch {
+      // 持久化失败不阻断 agent loop（如：磁盘满、权限不足）
+    }
+
+    // ── task14：context 压缩 ───────────────────────────────────────────────
+    // 当上一轮的 inputTokens 超过阈值时，触发 LLM 摘要压缩。
+    // 首轮（lastInputTokens === 0）不会触发（getCompressionThreshold 通常 > 0）。
+    if (state.lastInputTokens > 0) {
+      await checkAndCompressContext(
+        state,
+        model,
+        options.modelId,
+        callbacks.onContextCompressed,
+        cwd,
+      )
+    }
 
     const outcome = await runTurn(state, model, options, systemPrompt, callbacks, effectiveTools)
 
@@ -361,6 +401,13 @@ export async function agentLoop(
 
     if (outcome.finishReason === 'stop') {
       completedNormally = true
+      // ── task14：写 usage 快照 ───────────────────────────────────────────
+      // 正常完成时追加 usage 记录，便于后续统计和会话恢复时显示历史消耗。
+      try {
+        appendUsage(state, cwd)
+      } catch {
+        // 写 usage 失败不影响主流程
+      }
     }
 
     if (outcome.finishReason === 'content-filter') {

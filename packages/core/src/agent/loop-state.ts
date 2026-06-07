@@ -1,8 +1,9 @@
 // @mini-code-cli/core — Shared agent loop state
 //
-// 说明：这是 LoopState 的 task6 版本，在 task3 基础上新增了工具调用循环所需的字段：
-//   - recentToolCalls：Loop Guard 滑动窗口，用于检测死循环
-// 后续 task 会逐步添加字段（如 todos、persistedMessageCount 等）。
+// 说明：这是 LoopState 的 task14 版本，在 task6 基础上新增了会话持久化所需的字段：
+//   - persistedMessageCount：已写入 JSONL 文件的消息数（增量写入的游标）
+//   - sessionFilePath：本次会话的 JSONL 文件绝对路径（首次 flush 时确定）
+//   - taskSlug：任务简短标题（从第一条用户消息提取，用于文件名和列表显示）
 import type { ModelMessage } from 'ai'
 
 import type { PermissionMode, TokenUsage } from '../types/index.js'
@@ -44,6 +45,22 @@ export interface LoopState {
    *  用于检测模型是否在循环重复相同的调用。
    *  task6 新增，由 loop-guard.ts 维护。*/
   recentToolCalls: ToolCallRecord[]
+
+  // ── task14 新增：会话持久化字段 ─────────────────────────────────────────────
+
+  /** 已写入 JSONL 文件的消息数量（增量写入的游标）。
+   *  flushPendingMessages 只写 messages.slice(persistedMessageCount) 的部分，
+   *  写完后更新此字段。0 表示还未持久化任何消息。*/
+  persistedMessageCount: number
+  /** 本次会话的 JSONL 文件绝对路径。
+   *  第一次调用 flushPendingMessages 时由 getSessionFilePath 确定并写入此字段，
+   *  之后复用（避免每次重新计算）。null 表示还未初始化。*/
+  sessionFilePath: string | null
+  /** 任务简短标题（用于文件名和会话列表显示）。
+   *  由外部（CLI 或 use-agent）在创建 LoopState 后立即设置，
+   *  或由 hydrateLoopState 从 LoadedSession 恢复。
+   *  空字符串表示未设置（显示时用 firstPrompt 代替）。*/
+  taskSlug: string
 }
 
 // ── generateSessionId ────────────────────────────────────────────────────────
@@ -83,5 +100,9 @@ export function createLoopState(initialMode: PermissionMode = 'default'): LoopSt
     systemPromptCache: null,
     permissionMode: initialMode,
     recentToolCalls: [],
+    // task14 新增：会话持久化初始值
+    persistedMessageCount: 0,
+    sessionFilePath: null,
+    taskSlug: '',
   }
 }
