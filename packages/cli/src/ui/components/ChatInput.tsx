@@ -144,10 +144,18 @@ function buildFrame(state: FrameState): Cell[][] {
 /**
  * 比较当前帧与上一帧，生成最小化的 ANSI 更新序列。
  * 包含在 BSU/ESU_HIDE 之间以实现原子渲染。
+ *
+ * 关键约束：prev 和 next 的帧高必须相同（调用方负责在高度变化时传入空 prev）。
+ * 这样所有行的绝对行号保持一致，cell diff 才有意义。
+ *
+ * CJK 宽字符处理：
+ *   - cell 数组索引（c）≠ 视觉列（visualCol）
+ *   - 用 visualCol 做绝对定位，用 c 遍历 cell 数组
+ *   - prevRow 同样用视觉列对齐，否则 diff 比较错位
  */
 function buildDiffWrite(prev: Cell[][], next: Cell[][], termRows: number): string {
   const h = next.length
-  // 帧起始行（基于 termRows，1-indexed）
+  // 帧起始行（基于新帧高度，1-indexed）
   const frameTop = Math.max(1, termRows - h + 1)
 
   let buf = BSU
@@ -156,42 +164,47 @@ function buildDiffWrite(prev: Cell[][], next: Cell[][], termRows: number): strin
     const row = r + frameTop
     const prevRow = prev[r] ?? []
     const nextRow = next[r] ?? []
-    const maxCols = Math.max(prevRow.length, nextRow.length)
-    let wroteAnythingInRow = false
+    // 同时追踪 nextRow 和 prevRow 的视觉列指针
+    let visualCol = 1      // nextRow 当前 cell 的视觉列（1-indexed）
+    let prevVisualCol = 1  // prevRow 的对应视觉列
+    let prevIdx = 0        // prevRow 的遍历索引
 
     for (let c = 0; c < nextRow.length; c++) {
       const newCell = nextRow[c]!
-      const oldCell = prevRow[c]
+
+      // 推进 prevRow 到视觉列对齐位置
+      while (prevIdx < prevRow.length && prevVisualCol < visualCol) {
+        prevVisualCol += prevRow[prevIdx]?.width ?? 1
+        prevIdx++
+      }
+      const oldCell = prevVisualCol === visualCol ? prevRow[prevIdx] : undefined
 
       if (oldCell && cellsEqual(newCell, oldCell)) {
-        // CJK 宽字符：跳过第二个"半格"（宽度为 2 时由前一格覆盖）
-        if (newCell.width === 2) c++
+        visualCol += newCell.width
         continue
       }
 
-      // 需要重绘此格：移动光标并发射样式+字符
-      // 计算列位置（1-indexed）
-      let visualCol = 1
-      for (let ci = 0; ci < c; ci++) visualCol += nextRow[ci]?.width ?? 1
-
-      buf += `\x1b[${row};${visualCol}H` // CUP（绝对定位）
+      // 需要重绘：绝对定位 + 发射样式+字符
+      buf += `\x1b[${row};${visualCol}H`
       buf += newCell.style
       buf += newCell.char
-      wroteAnythingInRow = true
 
-      if (newCell.width === 2) c++ // 跳过宽字符的第二半格
+      visualCol += newCell.width
     }
 
-    // 若新行比旧行短，擦除旧行多余的部分
-    if (nextRow.length < prevRow.length && wroteAnythingInRow) {
-      let newVisualWidth = 0
-      for (const c of nextRow) newVisualWidth += c.width
-      buf += `\x1b[${row};${newVisualWidth + 1}H\x1b[K` // 擦除到行尾
+    // 新行比旧行窄时，擦除旧行多余部分
+    // 用 cell.width 求和得到精确的视觉宽度（不依赖 visualCol 的迭代值）
+    let oldVisualWidth = 0
+    for (const cell of prevRow) oldVisualWidth += cell.width
+    let newVisualWidth = 0
+    for (const cell of nextRow) newVisualWidth += cell.width
+    if (newVisualWidth < oldVisualWidth) {
+      // 不受 wroteAnythingInRow 限制：即使本行所有 cell 都没变，
+      // 只要行宽缩短了（如光标块从末尾移走），就必须擦除旧行尾部
+      buf += `\x1b[${row};${newVisualWidth + 1}H\x1b[K`
     }
-    void maxCols // 防止 lint 未使用警告
   }
 
-  // 将光标停在输入框最后一行末尾（DEC 2026 ESU 前的停泊位置）
   buf += S_RESET
   buf += ESU_HIDE
 
@@ -287,10 +300,11 @@ export function ChatInput({
     })
     const nextH = nextFrame.length
 
-    // 3. 当帧高度变化或有新 scrollback 内容时，需要重新定位
+    // 3. 帧高变化或有新 scrollback 内容时，强制全帧重绘
+    //    帧高变化时所有行的绝对行号都改变，cell diff 失效，必须清空。
     const prevH = lastFrameHRef.current
     if (nextH !== prevH || scrollbackContent) {
-      prevFrameRef.current = [] // 强制全帧重绘
+      prevFrameRef.current = []
     }
 
     // 4. 若有新 scrollback 内容，预先滚动为其腾出行
@@ -298,23 +312,38 @@ export function ChatInput({
     if (scrollbackContent) {
       const rows = countContentRows(scrollbackContent, termWidth)
       if (rows > 0) {
-        // 跳到终端最后一行并发射 LF，把内容区域向上推
         preBuf += `\x1b[${termRows};1H` + '\n'.repeat(rows)
       }
-      // 然后写入 scrollback 内容
       preBuf += scrollbackContent
     }
 
     // 5. 生成帧差分写入序列
     const diffWrite = buildDiffWrite(prevFrameRef.current, nextFrame, termRows)
 
-    // 6. 原子写入（滚动/内容 + 帧更新）
-    if (preBuf || diffWrite !== BSU + S_RESET + ESU_HIDE) {
-      // 确保帧区域已存在（首次绘制需要腾出 nextH 行）
-      let setupBuf = ''
-      if (prevH === 0 && nextH > 0) {
-        setupBuf = `\x1b[${termRows};1H` + '\n'.repeat(nextH - 1)
+    // 6. 原子写入
+    let setupBuf = ''
+    if (nextH > prevH) {
+      // 帧高增加（如 spinner 出现）：
+      // 先滚动腾出新增的行，再清空整个新帧区域（避免旧终端内容透出）。
+      const extraRows = nextH - prevH
+      // 滚动：把光标停在终端最后一行并发 \n，使内容上移腾出空间
+      setupBuf = `\x1b[${termRows};1H` + '\n'.repeat(extraRows)
+      // 清空整个新帧区域（termRows - nextH + 1 到 termRows）
+      const newFrameTop = Math.max(1, termRows - nextH + 1)
+      for (let r = 0; r < nextH; r++) {
+        setupBuf += `\x1b[${newFrameTop + r};1H\x1b[2K`
       }
+    } else if (nextH < prevH) {
+      // 帧高缩小（如 spinner 消失）：
+      // 先清除整个旧帧区域（所有 prevH 行），再全量重绘新帧。
+      // 旧帧起始行 = termRows - prevH + 1
+      const oldFrameTop = Math.max(1, termRows - prevH + 1)
+      for (let r = 0; r < prevH; r++) {
+        setupBuf += `\x1b[${oldFrameTop + r};1H\x1b[2K`
+      }
+    }
+
+    if (setupBuf || preBuf || diffWrite !== BSU + S_RESET + ESU_HIDE) {
       try {
         process.stdout.write(setupBuf + preBuf + diffWrite)
       } catch {

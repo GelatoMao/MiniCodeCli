@@ -114,7 +114,7 @@
   - 创建 `packages/cli/src/ui/hooks/use-prompt-input.ts`：stdin raw mode 键序列解析（方向键、Backspace、Enter、Esc、Ctrl 组合键、IME 合成）
   - _需求：需求 5.1, 5.2_
 
-- [ ] 9. 实现 use-agent Hook（React ↔ agentLoop 桥接）
+- [x] 9. 实现 use-agent Hook（React ↔ agentLoop 桥接）
   - 创建 `packages/cli/src/ui/hooks/use-agent.ts`：
     - `useAgent()` Hook，管理 `AgentState`（messages、isLoading、activeToolCalls 等）
     - `submit(text)`：构建 callbacks，调用 `agentLoop`，更新 React state

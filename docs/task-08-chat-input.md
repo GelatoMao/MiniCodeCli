@@ -97,22 +97,44 @@ function buildDiffWrite(prev: Cell[][], next: Cell[][], termRows: number): strin
 
   for (let r = 0; r < h; r++) {
     const row = r + frameTop
+    const prevRow = prev[r] ?? []
+    const nextRow = next[r] ?? []
+    // 两个指针分别追踪 nextRow 和 prevRow 的视觉列位置（1-indexed）
+    let visualCol = 1
+    let prevVisualCol = 1
+    let prevIdx = 0
+
     for (let c = 0; c < nextRow.length; c++) {
+      const newCell = nextRow[c]!
+      // 推进 prevRow 到与 visualCol 对齐的位置
+      while (prevIdx < prevRow.length && prevVisualCol < visualCol) {
+        prevVisualCol += prevRow[prevIdx]?.width ?? 1
+        prevIdx++
+      }
+      const oldCell = prevVisualCol === visualCol ? prevRow[prevIdx] : undefined
+
       if (oldCell && cellsEqual(newCell, oldCell)) {
-        if (newCell.width === 2) c++  // 跳过 CJK 宽字符的第二半格
+        visualCol += newCell.width   // 注意：只更新 visualCol，绝不 c++
         continue
       }
-      // 计算视觉列位置并发射更新
-      let visualCol = 1
-      for (let ci = 0; ci < c; ci++) visualCol += nextRow[ci]?.width ?? 1
+      // 需要重绘：用绝对坐标定位
       buf += `\x1b[${row};${visualCol}H${newCell.style}${newCell.char}`
+      visualCol += newCell.width
     }
+
+    // 新行比旧行窄时，擦除尾部残留内容
+    let oldVW = 0, newVW = 0
+    for (const cell of prevRow) oldVW += cell.width
+    for (const cell of nextRow) newVW += cell.width
+    if (newVW < oldVW) buf += `\x1b[${row};${newVW + 1}H\x1b[K`
   }
   return buf + S_RESET + ESU_HIDE
 }
 ```
 
-关键：CJK 字符宽度为 2，在内部 cell 数组中占一格，但视觉上跨两列。差分循环用 `visualCol` 追踪实际终端列（而非 cell 索引），保证定位精确。
+**关键设计**：Cell 数组中每个字符只占**一个槽位**（无论宽度是 1 还是 2）。`width: 2` 仅表示该字符在终端中占 2 列。循环变量 `c` 遍历 cell 槽位，`visualCol` 追踪真实的终端列坐标，两者独立前进。
+
+**prevRow 视觉列对齐**：diff 时必须把 prevRow 的指针推进到与 nextRow 的 `visualCol` 对齐的位置，才能正确找到对应的旧 cell。若用 cell 索引 `c` 直接索引 prevRow，CJK 字符之后的所有列都会错位一格（因为 CJK 字符视觉占 2 列但只占 1 个索引位）。
 
 ### 3. 括号粘贴检测（use-prompt-input.ts）
 
@@ -190,13 +212,57 @@ export const S_NONE = '\x1b[0m'
 
 Cell-diff 发射器：若 `cell.style !== lastStyle`，发射 `cell.style`。若 S_NONE 是空串，则样式"继承"上一个 cell 的颜色，导致颜色溢出/闪烁。
 
-### 3. CJK 宽字符的第二半格处理
+### 3. ❌ `if (newCell.width === 2) c++` 是错误的
+
+这是整个 Task 8 最隐蔽的 bug。最初的实现里有：
 
 ```typescript
 if (oldCell && cellsEqual(newCell, oldCell)) {
-  if (newCell.width === 2) c++  // 跳过宽字符的第二半格
+  if (newCell.width === 2) c++  // ← 错误！
   continue
+}
+// ...发射重绘...
+if (newCell.width === 2) c++    // ← 错误！
+```
+
+**错误假设**：以为 cell 数组里 CJK 宽字符占两个槽位，需要跳过"第二半格"。
+
+**实际情况**：Cell 数组里每个字符只有**一个槽位**，`width: 2` 只是描述视觉宽度。`c++` 会额外跳过下一个真实字符，导致该字符不被检查也不被绘制。
+
+**症状**：输入 `kanqilai zhenhaochi` 时，CJK 字符（`来`、`吃`）之后的字符（`i`、`w`）被吞掉，显示为 `kanqil▋i`（中间光标块把被跳过的字符位覆盖了）。
+
+**修复**：删除所有 `if (newCell.width === 2) c++`。视觉列偏移已经通过 `visualCol += newCell.width` 正确处理了，`c` 只需正常 `++1` 遍历每个 cell 槽位。
+
+### 4. 帧高增加时新腾出的行有旧内容残留
+
+**症状**：Spinner 出现后（帧高 +1），spinner 行上显示了之前输入框里打过的文字（如 `Thinking... 一下你自己`）。
+
+**根因**：帧高增加时，`setupBuf` 用 `\n` 在终端底部滚动腾出新行，但 `\n` 只是推动光标前进，**不清除那一行**。该行依然保留着终端历史中的旧内容。之后的 `diffWrite` 从空 prevFrame 全量重绘新帧，但 spinner 行（如 `Thinking…`）比旧输入行短，行尾的旧字符不会被新内容覆盖。
+
+```typescript
+// ❌ 错误：只滚动，不清除
+setupBuf = `\x1b[${termRows};1H` + '\n'.repeat(extraRows)
+
+// ✅ 正确：滚动后立即清空整个新帧区域
+setupBuf = `\x1b[${termRows};1H` + '\n'.repeat(extraRows)
+const newFrameTop = Math.max(1, termRows - nextH + 1)
+for (let r = 0; r < nextH; r++) {
+  setupBuf += `\x1b[${newFrameTop + r};1H\x1b[2K`  // \x1b[2K 清空整行
 }
 ```
 
-内部 cell 数组只为宽字符存**一个**格（width=2），但终端渲染时该字符占两列。如果不跳过，后续 cell 的 `visualCol` 计算会偏移一列，导致所有后续字符显示位置错误。
+**规律**：凡是用 `\n` 滚动腾出的行，必须随后显式用 `\x1b[2K` 清空，再靠 diffWrite 重绘。
+
+### 5. prevRow 按索引对齐导致 CJK 混合行 diff 错位
+
+**症状**：CJK+ASCII 混合行（如 `你a好b`），只有 ASCII 字符 `a` 变化时，diff 却在错误的列发射更新，或跳过某些字符。
+
+**根因**：初始实现用 `prevRow[c]` 直接按 cell 索引取旧 cell：
+
+```typescript
+const oldCell = prevRow[c]  // ← 错误：索引对齐，不是视觉列对齐
+```
+
+对于 `你a好b`，cell 索引 0=你、1=a、2=好、3=b，视觉列 1=你、3=a、4=好、6=b。当 nextRow 的 `visualCol=3`（对应 `a`），`prevRow[1]` 确实是 `a`——看起来对的。但若之前某处发生了宽度变化（宽字符换成窄字符），索引就对不上了。
+
+**修复**：对 prevRow 维护独立的 `prevVisualCol` 和 `prevIdx` 指针，每次把它推进到与 `visualCol` 对齐后再取 oldCell，确保比较的是视觉上相同位置的字符。
