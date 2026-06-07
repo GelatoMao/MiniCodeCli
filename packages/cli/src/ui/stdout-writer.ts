@@ -8,6 +8,11 @@
 // 聊天输入框）。该区域内容短且大多是 ASCII，Ink 自身的度量足够精确。
 //
 // Task 10 — 完整版：补全工具行渲染（duration 显示、状态图标）和 Markdown 前置渲染。
+// Task 11 — Markdown 集成：助手回复内容通过 renderMarkdown 渲染再写入 scrollback。
+//           对于流式片段（streamingChunk=true），不做 Markdown 渲染（逐字符渲染时
+//           Markdown 语法可能不完整），等 agentLoop 完成后提交为正式消息时再渲染。
+
+import { renderMarkdown, hasMarkdownSyntax } from './render-markdown.js'
 
 /** Ink 提供的 stdout 写入函数类型（与 Ink 的 log-update 协调） */
 export type InkWrite = (data: string) => void
@@ -278,6 +283,7 @@ export function writeMessageToStdout(
   }
 
   // 助手文字内容
+  // Task 11：非流式消息使用 Markdown 渲染；流式片段原样输出（内容可能不完整）。
   if (msg.content) {
     const isStreamContinuation = !!msg.streamingChunk && prevWriteWasStreamingChunk
     if (!prevWriteEndedWithBlankRow && !isStreamContinuation) {
@@ -285,16 +291,21 @@ export function writeMessageToStdout(
       prevWriteEndedWithBlankRow = true
     }
 
-    const out = msg.streamingChunk
-      ? msg.content.endsWith('\n')
-        ? msg.content
-        : msg.content + '\n'
-      : msg.content + '\n\n'
+    let renderedContent: string
+    if (msg.streamingChunk) {
+      // 流式片段：原样输出（Markdown 语法可能不完整，不做渲染）
+      renderedContent = msg.content.endsWith('\n') ? msg.content : msg.content + '\n'
+    } else {
+      // 完整消息：检测是否有 Markdown 语法，有则渲染
+      const text = msg.content
+      const rendered = hasMarkdownSyntax(text) ? renderMarkdown(text) : text
+      renderedContent = rendered + '\n\n'
+    }
 
-    write(toCRLF(out))
+    write(toCRLF(renderedContent))
 
     if (msg.streamingChunk) {
-      prevWriteEndedWithBlankRow = out.endsWith('\n\n')
+      prevWriteEndedWithBlankRow = renderedContent.endsWith('\n\n')
       prevWriteWasStreamingChunk = true
     } else {
       prevWriteEndedWithBlankRow = true

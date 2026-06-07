@@ -202,6 +202,15 @@ export function App({ model, options, initialPrompt }: AppProps): React.ReactEle
     }
   }, [state.pendingQuestion, resolveQuestion])
 
+  // ── 权限确认键处理（y/n）────────────────────────────────────────────────────
+  const handlePermissionKey = useCallback((key: 'y' | 'n') => {
+    if (key === 'y') {
+      resolvePermission('yes')
+    } else {
+      resolvePermission('no')
+    }
+  }, [resolvePermission])
+
   // ── 中断处理 ──────────────────────────────────────────────────────────────────
   const handleInterrupt = useCallback(() => {
     if (state.isLoading) {
@@ -219,10 +228,13 @@ export function App({ model, options, initialPrompt }: AppProps): React.ReactEle
         messages={displayMessages}
         onSubmit={submit}
         onInterrupt={handleInterrupt}
+        onPermissionKey={handlePermissionKey}
+        pendingPermission={state.pendingPermission != null}
         isLoading={state.isLoading}
         spinnerLabel={spinnerLabel}
         streamingText={state.streamingText || null}
         disabled={state.isLoading && options.printMode}
+        tokenUsage={state.tokenUsage.totalTokens > 0 ? state.tokenUsage : null}
       />
     </>
   )

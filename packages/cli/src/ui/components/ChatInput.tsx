@@ -19,6 +19,8 @@
 //   - scrollback 提交（append-only commit）
 //   - 基本键盘输入处理
 //   - 不含斜杠补全、@-mention、权限对话框等（Task 9+ 扩展）
+//
+// Task 11 — Token 状态栏：在分隔线末尾右对齐显示 token 用量（input/output/cache/context%）
 import React, { useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react'
 
 import { useStdout } from 'ink'
@@ -31,6 +33,7 @@ import { charWidth, visualWidth } from '../text-width.js'
 import { writeMessageToStdout } from '../stdout-writer.js'
 import type { DisplayMessage } from '../display-types.js'
 import { usePromptInput } from '../hooks/use-prompt-input.js'
+import type { TokenUsage } from '@mini-code-cli/core'
 
 // ── 常量 ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +52,13 @@ export interface ChatInputProps {
   messages: readonly DisplayMessage[]
   onSubmit: (text: string) => void
   onInterrupt: () => void
+  /**
+   * 权限确认回调（pendingPermission 场景）。
+   * 用户按 y/n 时调用，绕过 isLoading 屏蔽。
+   */
+  onPermissionKey?: (key: 'y' | 'n') => void
+  /** 是否有权限确认等待用户输入（决定是否激活 y/n 快捷键） */
+  pendingPermission?: boolean
   /** true = AI 请求/工具运行中，驱动 spinner 显示和 Esc 取消路由 */
   isLoading?: boolean
   /** 临时一行通知（如"再按 Ctrl+C 退出"），显示在输入框下方 */
@@ -62,6 +72,11 @@ export interface ChatInputProps {
    * 显示在 spinner 行上方，agentLoop 完成后由 use-agent 提交为正式消息。
    */
   streamingText?: string | null
+  /**
+   * Token 用量统计（Task 11）。
+   * 显示在分隔线右侧：input/output/cache read/context%
+   */
+  tokenUsage?: TokenUsage | null
 }
 
 // ── 辅助：构建输入行 cells ─────────────────────────────────────────────────
@@ -103,18 +118,128 @@ interface FrameState {
   streamingText: string | null
   notice: string | null
   termWidth: number
+  tokenUsage: TokenUsage | null
+}
+
+// ── Token 状态栏渲染 ─────────────────────────────────────────────────────────
+
+// Token 颜色（用于分隔线右侧的状态栏）
+const S_TOKEN_IN = '\x1b[0m\x1b[38;2;147;165;255m'   // 蓝紫色（input tokens）
+const S_TOKEN_OUT = '\x1b[0m\x1b[38;2;78;186;101m'   // 绿色（output tokens）
+const S_TOKEN_CACHE = '\x1b[0m\x1b[38;2;209;154;102m' // 橙色（cache read tokens）
+const S_TOKEN_CTX = '\x1b[0m\x1b[38;2;136;136;136m'  // 灰色（context 百分比）
+const S_TOKEN_SEP = '\x1b[0m\x1b[38;2;80;80;100m'    // 暗灰（分隔符）
+
+/**
+ * 格式化 token 数量为人类可读的简短字符串。
+ * < 1k → "NNN"；>= 1k → "N.Nk"；>= 100k → "NNNk"
+ */
+function formatTokenCount(n: number): string {
+  if (n < 1000) return String(n)
+  if (n < 100000) return `${(n / 1000).toFixed(1)}k`
+  return `${Math.round(n / 1000)}k`
+}
+
+/**
+ * 构建 token 状态栏字符串（含 ANSI 颜色）。
+ * 格式：in:NNNk  out:NNNk  cache:NNNk  ctx:NN%
+ *
+ * 仅在有非零 token 时显示（agentLoop 尚未开始时不显示）。
+ */
+function buildTokenStatusText(usage: TokenUsage | null): string {
+  if (!usage || usage.totalTokens === 0) return ''
+
+  const parts: string[] = []
+
+  if (usage.inputTokens > 0) {
+    parts.push(`${S_TOKEN_IN}in:${formatTokenCount(usage.inputTokens)}${S_TOKEN_SEP}`)
+  }
+  if (usage.outputTokens > 0) {
+    parts.push(`${S_TOKEN_OUT}out:${formatTokenCount(usage.outputTokens)}${S_TOKEN_SEP}`)
+  }
+  if ((usage.cacheReadTokens ?? 0) > 0) {
+    parts.push(`${S_TOKEN_CACHE}cache:${formatTokenCount(usage.cacheReadTokens ?? 0)}${S_TOKEN_SEP}`)
+  }
+  if (usage.currentContextTokens != null && usage.currentContextTokens > 0) {
+    // 假设模型上下文窗口为 200k（通用估算，实际应从 capabilities 获取）
+    const pct = Math.min(99, Math.round((usage.currentContextTokens / 200000) * 100))
+    parts.push(`${S_TOKEN_CTX}ctx:${pct}%${S_TOKEN_SEP}`)
+  }
+
+  if (parts.length === 0) return ''
+
+  // 去掉最后一个 S_TOKEN_SEP（尾部无需分隔符）
+  const joined = parts.join(`${S_TOKEN_SEP} `)
+  return joined
+}
+
+/**
+ * 将 token 状态文字（含 ANSI）转换为 Cell 行，右对齐填充到 termWidth。
+ * 分隔线行 = 左侧灰色 ─ + 右侧 token 状态栏。
+ */
+function buildSeparatorWithTokens(tokenUsage: TokenUsage | null, termWidth: number): Cell[] {
+  const tokenText = buildTokenStatusText(tokenUsage)
+
+  if (!tokenText) {
+    // 无 token 信息：纯分隔线
+    const sep = '─'.repeat(Math.max(0, termWidth))
+    return textToCells(sep, S_DIM)
+  }
+
+  // 计算 token 状态文字的可见宽度（去掉 ANSI）
+  const visibleToken = tokenText.replace(/\x1b\[[0-9;]*m/g, '')
+  const tokenVisWidth = visibleToken.length
+
+  // 分隔线宽度 = termWidth - tokenVisWidth - 1（右侧留1空格）
+  const sepLen = Math.max(0, termWidth - tokenVisWidth - 1)
+  const sep = '─'.repeat(sepLen)
+
+  // 拼接：[灰色分隔线][空格][token 状态栏]
+  // 注意：tokenText 含有 ANSI 序列，不能直接用 textToCells，
+  // 用特殊处理：把 token 状态作为单个宽度等于 tokenVisWidth 的 "cell block" 追加
+  const sepCells = textToCells(sep + ' ', S_DIM)
+
+  // 将 token 字符串拆成单字符 cells（忽略 ANSI，只处理可见字符）
+  // 简化：把整个 tokenText 作为一个 style-less raw output cell
+  // 由于 token 状态文字含有多个样式段，采用逐字符分配的方式
+  // 这里用更简单的做法：把 tokenText 写入最后一个 "special cell"，style = tokenText 本身
+  // Cell 的 style 字段是前缀，char 是字符 — 我们把可见部分拆开
+
+  // 解析 tokenText 为 (style, char) 对
+  const tokenCells: Cell[] = []
+  const ansiRegex = /\x1b\[[0-9;]*m/g
+  let lastStyle = S_DIM
+  let lastIndex = 0
+
+  let match: RegExpExecArray | null
+  while ((match = ansiRegex.exec(tokenText)) !== null) {
+    // 写入 match 之前的可见字符
+    const visChars = tokenText.slice(lastIndex, match.index)
+    for (const ch of visChars) {
+      tokenCells.push({ char: ch, style: lastStyle, width: 1 })
+    }
+    lastStyle = match[0]!
+    lastIndex = match.index + match[0]!.length
+  }
+  // 剩余可见字符
+  const remaining = tokenText.slice(lastIndex)
+  for (const ch of remaining) {
+    tokenCells.push({ char: ch, style: lastStyle, width: 1 })
+  }
+
+  return [...sepCells, ...tokenCells]
 }
 
 /**
  * 构建当前帧的 Cell 网格（全部行）：
  *   行0~N: streamingText 预览行（若 streamingText 非空）
  *   行N+1: Spinner 行（若 spinnerLabel 非 null）
- *   行N+2: 分隔线
+ *   行N+2: 分隔线（含 token 状态栏，Task 11）
  *   行N+3~K: 输入框行（光标、换行）
  *   行K+1: notice 行（若 notice 非 null）
  */
 function buildFrame(state: FrameState): Cell[][] {
-  const { text, cursor, spinnerFrame, spinnerLabel, streamingText, notice, termWidth } = state
+  const { text, cursor, spinnerFrame, spinnerLabel, streamingText, notice, termWidth, tokenUsage } = state
   const rows: Cell[][] = []
 
   // 流式预览行（实时输出的文字，不进 scrollback）
@@ -135,9 +260,8 @@ function buildFrame(state: FrameState): Cell[][] {
     rows.push(spinnerCells)
   }
 
-  // 分隔线（细灰色）
-  const sep = '─'.repeat(Math.max(0, termWidth))
-  rows.push(textToCells(sep, S_DIM))
+  // 分隔线（含 Token 状态栏，Task 11）
+  rows.push(buildSeparatorWithTokens(tokenUsage, termWidth))
 
   // 输入框行（带前缀 "❯ "）
   const prefix = '❯ '
@@ -235,11 +359,14 @@ export function ChatInput({
   messages,
   onSubmit,
   onInterrupt,
+  onPermissionKey,
+  pendingPermission = false,
   isLoading = false,
   notice,
   disabled,
   spinnerLabel,
   streamingText,
+  tokenUsage,
 }: ChatInputProps): null {
   const [{ text, cursor }, dispatch] = useReducer(inputReducer, { text: '', cursor: 0 } as InputState)
   const cursorRef = useRef(0)
@@ -317,6 +444,7 @@ export function ChatInput({
       streamingText: streamingText ?? null,
       notice: notice ?? null,
       termWidth,
+      tokenUsage: tokenUsage ?? null,
     })
     const nextH = nextFrame.length
 
@@ -395,6 +523,18 @@ export function ChatInput({
     enabled: !disabled,
     onInterrupt,
     onText: (chunk) => {
+      // 权限确认模式：优先处理 y/n，不受 isLoading 屏蔽
+      if (pendingPermission && onPermissionKey) {
+        const lower = chunk.toLowerCase()
+        if (lower === 'y') {
+          onPermissionKey('y')
+          return
+        }
+        if (lower === 'n') {
+          onPermissionKey('n')
+          return
+        }
+      }
       if (isLoading) return // 加载时屏蔽输入（但 Ctrl+C 仍可用）
       dispatch({ type: 'INSERT', pos: cursorRef.current, chunk })
     },
