@@ -44,6 +44,7 @@ export interface ChatInputProps {
    * 所有 scrollback 消息。新条目通过直接写 stdout 提交到终端历史。
    * 我们持有整个底部区域 —— Ink 不得再写 scrollback，否则其
    * log-update 会与我们争夺光标位置。
+   * 注意：只传已最终提交的消息，流式预览文字通过 streamingText prop 传入。
    */
   messages: readonly DisplayMessage[]
   onSubmit: (text: string) => void
@@ -56,6 +57,11 @@ export interface ChatInputProps {
   disabled?: boolean
   /** Spinner 文字（如"Thinking…"），null/undefined = 不显示 */
   spinnerLabel?: string | null
+  /**
+   * 当前流式输出的文字片段（实时预览，不写入 scrollback）。
+   * 显示在 spinner 行上方，agentLoop 完成后由 use-agent 提交为正式消息。
+   */
+  streamingText?: string | null
 }
 
 // ── 辅助：构建输入行 cells ─────────────────────────────────────────────────
@@ -94,20 +100,32 @@ interface FrameState {
   cursor: number
   spinnerFrame: number
   spinnerLabel: string | null
+  streamingText: string | null
   notice: string | null
   termWidth: number
 }
 
 /**
  * 构建当前帧的 Cell 网格（全部行）：
- *   行0~N: 分隔线（可选）
- *   行N+1~M: Spinner 行（若 spinnerLabel 非 null）
- *   行M+1~K: 输入框行（光标、换行）
+ *   行0~N: streamingText 预览行（若 streamingText 非空）
+ *   行N+1: Spinner 行（若 spinnerLabel 非 null）
+ *   行N+2: 分隔线
+ *   行N+3~K: 输入框行（光标、换行）
  *   行K+1: notice 行（若 notice 非 null）
  */
 function buildFrame(state: FrameState): Cell[][] {
-  const { text, cursor, spinnerFrame, spinnerLabel, notice, termWidth } = state
+  const { text, cursor, spinnerFrame, spinnerLabel, streamingText, notice, termWidth } = state
   const rows: Cell[][] = []
+
+  // 流式预览行（实时输出的文字，不进 scrollback）
+  // 只显示最后一行（避免帧高随内容增长导致频繁滚动）
+  if (streamingText) {
+    const lines = streamingText.split('\n').filter((l) => l.length > 0)
+    const lastLine = lines[lines.length - 1] ?? ''
+    if (lastLine) {
+      rows.push(textToCells(lastLine, S_DIM))
+    }
+  }
 
   // Spinner 行
   if (spinnerLabel) {
@@ -221,6 +239,7 @@ export function ChatInput({
   notice,
   disabled,
   spinnerLabel,
+  streamingText,
 }: ChatInputProps): null {
   const [{ text, cursor }, dispatch] = useReducer(inputReducer, { text: '', cursor: 0 } as InputState)
   const cursorRef = useRef(0)
@@ -295,6 +314,7 @@ export function ChatInput({
       cursor,
       spinnerFrame,
       spinnerLabel: spinnerLabel ?? null,
+      streamingText: streamingText ?? null,
       notice: notice ?? null,
       termWidth,
     })
@@ -307,45 +327,59 @@ export function ChatInput({
       prevFrameRef.current = []
     }
 
-    // 4. 若有新 scrollback 内容，预先滚动为其腾出行
-    let preBuf = ''
-    if (scrollbackContent) {
-      const rows = countContentRows(scrollbackContent, termWidth)
-      if (rows > 0) {
-        preBuf += `\x1b[${termRows};1H` + '\n'.repeat(rows)
-      }
-      preBuf += scrollbackContent
+    // 4-6. 统一处理滚动、scrollback 写入与帧渲染
+    //
+    // 设计原则：所有需要终端向上滚动的操作（帧高增加 + scrollback 内容写入）
+    // 在同一次 `\x1b[${termRows};1H` + `\n` 中完成，避免双重滚动。
+    //
+    // 步骤：
+    //   (A) 计算总滚动行数 = extraFrameRows（帧高增加）+ scrollbackRows（新消息行数）
+    //   (B) 在终端末行发 totalScroll 个 \n → 一次性滚动
+    //   (C) 若帧高缩小：清除旧帧多余行（帧缩小不需要额外滚动）
+    //   (D) 若有 scrollback 内容：用绝对定位写入腾出的行
+    //   (E) buildDiffWrite 全量/差分重绘帧到终端底部
+
+    const scrollbackRows = scrollbackContent
+      ? countContentRows(scrollbackContent, termWidth)
+      : 0
+    const extraFrameRows = nextH > prevH ? nextH - prevH : 0
+    const totalScroll = extraFrameRows + scrollbackRows
+
+    let setupBuf = ''
+
+    if (totalScroll > 0) {
+      // (B) 一次性在终端末行触发所有需要的滚动
+      setupBuf += `\x1b[${termRows};1H` + '\n'.repeat(totalScroll)
     }
 
-    // 5. 生成帧差分写入序列
+    if (nextH < prevH) {
+      // (C) 帧缩小：清除旧帧多余行（滚动后位置）。
+      // 滚动了 totalScroll 行后，旧帧多余行在
+      //   termRows-prevH+1-totalScroll ~ termRows-nextH-totalScroll
+      //   （即 scrollbackContent + 新帧的覆盖范围上方）
+      // 必须手动清除，否则旧帧内容（如 spinner）残留可见。
+      const clearFrom = Math.max(1, termRows - prevH + 1 - totalScroll)
+      const clearTo = Math.max(0, termRows - nextH - totalScroll)
+      for (let r = clearFrom; r <= clearTo; r++) {
+        setupBuf += `\x1b[${r};1H\x1b[2K`
+      }
+    }
+
+    if (scrollbackContent && scrollbackRows > 0) {
+      // (D) 用绝对定位将 scrollbackContent 写入腾出的行
+      // 滚动后，帧的目标是 termRows-nextH+1 ~ termRows（由 buildDiffWrite 绘制）
+      // scrollback 内容紧贴帧上方，占用 termRows-nextH-scrollbackRows+1 ~ termRows-nextH 行
+      const contentStart = Math.max(1, termRows - nextH - scrollbackRows + 1)
+      setupBuf += `\x1b[${contentStart};1H`
+      setupBuf += scrollbackContent
+    }
+
+    // (E) 生成帧差分写入序列（prevFrameRef=[] 时全量重绘）
     const diffWrite = buildDiffWrite(prevFrameRef.current, nextFrame, termRows)
 
-    // 6. 原子写入
-    let setupBuf = ''
-    if (nextH > prevH) {
-      // 帧高增加（如 spinner 出现）：
-      // 先滚动腾出新增的行，再清空整个新帧区域（避免旧终端内容透出）。
-      const extraRows = nextH - prevH
-      // 滚动：把光标停在终端最后一行并发 \n，使内容上移腾出空间
-      setupBuf = `\x1b[${termRows};1H` + '\n'.repeat(extraRows)
-      // 清空整个新帧区域（termRows - nextH + 1 到 termRows）
-      const newFrameTop = Math.max(1, termRows - nextH + 1)
-      for (let r = 0; r < nextH; r++) {
-        setupBuf += `\x1b[${newFrameTop + r};1H\x1b[2K`
-      }
-    } else if (nextH < prevH) {
-      // 帧高缩小（如 spinner 消失）：
-      // 先清除整个旧帧区域（所有 prevH 行），再全量重绘新帧。
-      // 旧帧起始行 = termRows - prevH + 1
-      const oldFrameTop = Math.max(1, termRows - prevH + 1)
-      for (let r = 0; r < prevH; r++) {
-        setupBuf += `\x1b[${oldFrameTop + r};1H\x1b[2K`
-      }
-    }
-
-    if (setupBuf || preBuf || diffWrite !== BSU + S_RESET + ESU_HIDE) {
+    if (setupBuf || diffWrite !== BSU + S_RESET + ESU_HIDE) {
       try {
-        process.stdout.write(setupBuf + preBuf + diffWrite)
+        process.stdout.write(setupBuf + diffWrite)
       } catch {
         /* tty closed */
       }

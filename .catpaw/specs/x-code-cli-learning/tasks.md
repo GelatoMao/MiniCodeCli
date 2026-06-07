@@ -128,7 +128,7 @@
 
 ## 阶段四：流式渲染与 Markdown
 
-- [ ] 10. 实现流式文字渲染
+- [x] 10. 实现流式文字渲染
   - 创建 `packages/cli/src/ui/hooks/use-stream-buffer.ts`：delta 累积 → 定时 flush → `appendMessage`
   - 实现 `DisplayMessage` 类型：`role`、`content`、`toolCalls`、`kind`（command-echo/command-result）
   - 在 `ChatInput` 中实现消息滚动区渲染（`writtenMessageCountRef` diff，append-only）
