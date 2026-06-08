@@ -9,23 +9,29 @@
 ### 前置要求
 
 - **Node.js >= 20.19.0**
-- **pnpm**（用于从源码构建）
+
+### npm 全局安装（推荐）
+
+```bash
+npm install -g @mini-code-cli/cli
+```
+
+安装完成后即可在任意目录使用 `mini-code` 或 `mc` 命令。
+
+> **注意**：包内置了绝大多数依赖（单文件 bundle），安装时会额外下载 `@vscode/ripgrep` 原生二进制（用于文件搜索），首次安装耗时稍长属正常现象。
 
 ### 从源码构建
+
+适合想修改源码或参与开发的场景：
 
 ```bash
 git clone <repo-url>
 cd mini-code-cli
 
-pnpm install
+pnpm install   # 需要 pnpm
 pnpm build
-```
 
-构建产物位于 `packages/cli/dist/`，入口为 `dist/cli.js`。
-
-### 全局安装（可选）
-
-```bash
+# 全局链接
 cd packages/cli
 npm link
 ```
