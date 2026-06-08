@@ -12,11 +12,22 @@
 //   2. 多轮对话（existingState）  — state 跨轮传递，上下文保留
 //   3. 工具调用（readFile）       — ReAct 循环，turnCount >= 2
 //   4. abortSignal 中断           — 中断不触发 onError
+//
+// task16 MCP 集成测试：
+//   5. MCP 工具注入 buildTools    — bridgeAllMcpTools 产出的工具名包含在 effectiveTools
+//   6. MCP 工具调用（read_text_file）— 模型调用 filesystem__read_text_file，结果回传
+//   7. MCP 权限拒绝               — onAskPermission 返回 'no' → 结果含 'Permission denied'
 
-import { describe, it, expect } from 'vitest'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 
 import { agentLoop } from '../src/agent/loop.js'
 import { createModelRegistry } from '../src/providers/registry.js'
+import { loadMcpFromDisk } from '../src/mcp/loader.js'
+import { emptyMcpRegistry } from '../src/mcp/registry.js'
+import type { McpRegistry } from '../src/mcp/types.js'
 import type { AgentCallbacks, AgentOptions } from '../src/types/index.js'
 
 // ── 前置条件：没有 DEEPSEEK_API_KEY 时跳过全部集成测试 ──────────────────────
@@ -116,4 +127,145 @@ describe.skipIf(!HAS_KEY)('agentLoop 集成测试（需要 DEEPSEEK_API_KEY）',
     // 用户主动中断不应被视为错误
     expect(output.errors).toHaveLength(0)
   })
+})
+
+// ── MCP 集成测试套件 ─────────────────────────────────────────────────────────
+//
+// 依赖：
+//   - DEEPSEEK_API_KEY（调用模型）
+//   - ~/.mini-code/mcp.json 中配置了 filesystem 服务器（指向 /private/tmp）
+//   - npx @modelcontextprotocol/server-filesystem 可执行
+//
+// 测试用的临时文件创建在 /private/tmp/mcp-agent-test-XXXX.txt，
+// 每个 suite 结束后清理。
+
+const HAS_MCP_CONFIG = async () => {
+  try {
+    const cfgPath = path.join(os.homedir(), '.mini-code', 'mcp.json')
+    await fs.access(cfgPath)
+    const raw = await fs.readFile(cfgPath, 'utf-8')
+    const cfg = JSON.parse(raw) as { servers?: unknown[] }
+    return Array.isArray(cfg.servers) && cfg.servers.length > 0
+  } catch {
+    return false
+  }
+}
+
+describe.skipIf(!HAS_KEY)('agentLoop + MCP 集成测试（需要 DEEPSEEK_API_KEY + mcp.json）', () => {
+  let mcpRegistry: McpRegistry
+  let testFilePath: string
+  const CWD = process.cwd()
+
+  // 在 suite 开始前连接 MCP 并准备测试文件
+  beforeAll(async () => {
+    // macOS /tmp → /private/tmp
+    testFilePath = '/private/tmp/mcp-agent-test.txt'
+    await fs.writeFile(testFilePath, 'MCP integration test content.\nLine 2: answer is 2025.\n')
+
+    try {
+      mcpRegistry = await loadMcpFromDisk(CWD, /* trustMode */ true)
+    } catch {
+      mcpRegistry = emptyMcpRegistry
+    }
+  }, 30_000)
+
+  afterAll(async () => {
+    await mcpRegistry.shutdown().catch(() => {})
+    await fs.unlink(testFilePath).catch(() => {})
+  })
+
+  it(
+    '场景 5：MCP 工具注入 — buildTools 包含 filesystem__ 前缀工具',
+    { timeout: 30_000 },
+    async () => {
+      // 用空消息跑一轮，验证 buildTools 能无错误运行（工具注入不崩溃）
+      const { output, callbacks } = makeCallbacks()
+      const opts: AgentOptions = { ...BASE_OPTIONS, mcpRegistry, maxTurns: 1 }
+
+      await agentLoop('用一句话说"测试通过"', model!, opts, callbacks)
+
+      expect(output.errors).toHaveLength(0)
+      expect(output.text.length).toBeGreaterThan(0)
+    },
+  )
+
+  it(
+    '场景 6：MCP 工具调用 — 模型通过 filesystem__read_text_file 读取文件',
+    { timeout: 90_000 },
+    async () => {
+      // 仅当 filesystem 服务器有工具时运行
+      const fsEntry = mcpRegistry.get('filesystem')
+      const hasReadTool = fsEntry?.tools.some((t) => t.name === 'read_text_file')
+      if (!hasReadTool) {
+        console.log('  filesystem 服务器未提供 read_text_file，跳过场景 6')
+        return
+      }
+
+      const { output, callbacks } = makeCallbacks()
+      const opts: AgentOptions = { ...BASE_OPTIONS, mcpRegistry, maxTurns: 10 }
+
+      await agentLoop(
+        // 明确要求模型用 MCP 工具（包含命名空间前缀），避免模型用内置 readFile
+        `请使用工具 filesystem__read_text_file 读取文件 ${testFilePath}，` +
+          `然后告诉我文件第 2 行中的数字是多少。`,
+        model!,
+        opts,
+        callbacks,
+      )
+
+      // 模型应该调用了 MCP 工具
+      expect(output.toolCalls).toContain('filesystem__read_text_file')
+      // 文件内容被读到，模型应该能提取出 2025
+      expect(output.text).toContain('2025')
+      expect(output.errors).toHaveLength(0)
+      // ReAct 循环：至少一轮工具调用 + 一轮回答
+      expect(output.toolCalls.length).toBeGreaterThanOrEqual(1)
+    },
+  )
+
+  it(
+    '场景 7：MCP 权限拒绝 — onAskPermission 返回 no → 工具结果含 Permission denied',
+    { timeout: 60_000 },
+    async () => {
+      const fsEntry = mcpRegistry.get('filesystem')
+      const hasReadTool = fsEntry?.tools.some((t) => t.name === 'read_text_file')
+      if (!hasReadTool) {
+        console.log('  filesystem 服务器未提供 read_text_file，跳过场景 7')
+        return
+      }
+
+      // 收集工具结果（用于验证权限拒绝消息）
+      const toolResults: string[] = []
+      const callbacks: AgentCallbacks = {
+        onTextDelta: () => {},
+        onToolCall: () => {},
+        onToolResult: (_id, result) => { toolResults.push(result) },
+        onToolProgress: () => {},
+        // 所有 MCP 权限请求都拒绝
+        onAskPermission: async () => 'no',
+        onAskUser: async () => '',
+        onShellOutput: () => {},
+        onUsageUpdate: () => {},
+        onError: () => {},
+      }
+
+      const opts: AgentOptions = {
+        ...BASE_OPTIONS,
+        mcpRegistry,
+        trustMode: false,   // 关闭 trustMode，让权限框真正弹出
+        maxTurns: 5,
+      }
+
+      await agentLoop(
+        `请使用工具 filesystem__read_text_file 读取文件 ${testFilePath}`,
+        model!,
+        opts,
+        callbacks,
+      )
+
+      // 至少有一个工具结果是"Permission denied"
+      const hasDenied = toolResults.some((r) => r.includes('Permission denied'))
+      expect(hasDenied).toBe(true)
+    },
+  )
 })

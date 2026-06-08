@@ -27,6 +27,11 @@
 //   - agentLoop 新增可选参数 toolsOverride（runner.ts 通过此参数注入子工具集）
 //   - 主 agent 的 buildTools 通过 createSubAgentRegistry 构建 task 工具并注入
 //
+// task16 新增：
+//   - buildTools 从 options.mcpRegistry 注入 MCP 工具（bridgeAllMcpTools）
+//   - MCP 工具为手动分发（无 execute），产出 tool-call chunk 后由 handleMcpToolCall 处理
+//   - toolsOverride 场景（sub-agent）不注入 MCP 工具（sub-agent 工具白名单不含 MCP）
+//
 // 核心函数调用链：
 //   agentLoop
 //     └─ while loop
@@ -48,6 +53,7 @@ import { applyCacheControl } from '../providers/cache-control.js'
 import { toolRegistry, truncateToolResult } from '../tools/index.js'
 import { createTaskTool } from '../tools/task.js'
 import { clearProgressReporter, setProgressReporter } from '../tools/progress.js'
+import { bridgeAllMcpTools } from '../mcp/tool-bridge.js'
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
 import { createLoopState } from './loop-state.js'
 import type { LoopState } from './loop-state.js'
@@ -89,34 +95,45 @@ export interface AgentLoopResult {
  *    - 否则构建完整工具集：toolRegistry + task 工具（sub-agent 委托）
  *    - task 工具通过 createSubAgentRegistry 动态构建，包含所有可用 sub-agent 的描述
  *
- *  task16 会注入 MCP 工具。
+ *  task16 新增：
+ *    - 如果 options.mcpRegistry 非空且不是 toolsOverride 场景，
+ *      调用 bridgeAllMcpTools 将所有 MCP 工具合并到工具集
+ *    - MCP 工具名格式："<serverName>__<toolName>"（命名空间前缀防冲突）
+ *    - sub-agent (toolsOverride) 场景不注入 MCP 工具（工具白名单已固定）
  *
  *  - 有 execute 的工具（readFile/glob/grep/listDir）：AI SDK 在 fullStream 内部自动执行
- *  - 无 execute 的工具（writeFile/edit/shell/task）：产出 tool-call chunk，
+ *  - 无 execute 的工具（writeFile/edit/shell/task/MCP）：产出 tool-call chunk，
  *    由 agentLoop 在 finishReason='tool-calls' 时调用 processToolCalls 手动处理
  *
- *  @param _options    AgentOptions（预留，task16 MCP 注入时会用到）
- *  @param cwd         当前工作目录（用于加载项目级自定义 sub-agent）
+ *  @param options       AgentOptions（task16：通过 mcpRegistry 字段注入 MCP）
+ *  @param cwd           当前工作目录（用于加载项目级自定义 sub-agent）
  *  @param toolsOverride 如果非 null，直接返回它（用于 sub-agent 工具过滤）*/
 async function buildTools(
-  _options: AgentOptions,
+  options: AgentOptions,
   cwd?: string,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   toolsOverride?: Record<string, any> | null,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 ): Promise<Record<string, any>> {
   // sub-agent 场景：工具集已由 runner.ts 过滤，直接使用
+  // sub-agent 不注入 MCP 工具（工具白名单由 built-in.ts 固定）
   if (toolsOverride != null) {
     return toolsOverride
   }
 
-  // 主 agent 场景：构建完整工具集（静态工具 + task 工具）
+  // 主 agent 场景：构建完整工具集（静态工具 + task 工具 + MCP 工具）
   const registry = await createSubAgentRegistry(cwd)
   const taskTool = createTaskTool(registry)
+
+  // task16：注入 MCP 工具
+  // mcpRegistry 由 CLI 在启动时调用 loadMcpFromDisk() 初始化并传入
+  // 若无 MCP 配置或加载失败，mcpRegistry 为 undefined，mcpTools 为空对象
+  const mcpTools = options.mcpRegistry ? bridgeAllMcpTools(options.mcpRegistry) : {}
 
   return {
     ...toolRegistry,
     task: taskTool,
+    ...mcpTools,
   }
 }
 

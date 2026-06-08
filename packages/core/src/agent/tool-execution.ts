@@ -10,6 +10,11 @@
 //   - processToolCalls 新增参数 effectiveTools，传给 handleTaskTool 进行工具白名单过滤
 //   - task 工具被放入 BYPASS_LOOP_GUARD_HANDLERS（绕过循环守卫，有独立的并行批处理）
 //
+// task16 新增：
+//   - handleMcpToolCall：MCP 工具处理器（命名空间化工具名 → McpRegistry.callTool）
+//   - MCP 工具经过：Loop Guard → MCP always-allow 权限检查 → registry.callTool → 结果推送
+//   - isMangledName() 用于识别 MCP 工具调用
+//
 // 主要导出：
 //   processToolCalls  — 处理单轮模型输出的所有工具调用
 //   partitionToolCalls — 将 task 工具的连续调用分批（并行执行）
@@ -19,6 +24,8 @@ import path from 'node:path'
 import type { ModelMessage } from 'ai'
 
 import { checkPermission } from '../permissions/index.js'
+import { isMcpToolAlwaysAllowed, allowMcpTool } from '../mcp/permissions.js'
+import { isMangledName, demangleName } from '../mcp/name-mangling.js'
 import { truncateToolResult } from '../tools/index.js'
 import { clearProgressReporter, reportProgress } from '../tools/progress.js'
 import { getShellProvider } from '../tools/shell-provider.js'
@@ -306,13 +313,94 @@ async function handleTaskTool(ctx: HandlerCtx): Promise<void> {
   )
 }
 
+// ── handleMcpToolCall ─────────────────────────────────────────────────────────
+
+/** MCP 工具处理器（task16 新增）。
+ *
+ *  路由流程：
+ *    1. 从命名空间化工具名（"serverName__toolName"）解析出服务器名和工具名
+ *    2. 检查 MCP always-allow 权限：
+ *       - trustMode || always-allow 已记录 → 直接执行
+ *       - 否则弹权限对话框（yes/always/no）
+ *    3. 通过 options.mcpRegistry.callTool 调用 MCP 服务器
+ *    4. 推送结果
+ *
+ *  不放入 BYPASS_LOOP_GUARD_HANDLERS：
+ *    MCP 工具需要经过循环守卫，防止模型反复调用同一个 MCP 工具。
+ *    handleToolCall 会在权限检查之前先走 applyLoopGuard，再进入这里。
+ *
+ *  不放入 checkWriteOrShellPermission：
+ *    MCP 工具有专属权限检查逻辑（always-allow 基于 MCP 命名空间），
+ *    与内置工具的 shell/writeFile/edit 检查逻辑不同。
+ */
+async function handleMcpToolCall(ctx: HandlerCtx): Promise<void> {
+  const { toolName, input, toolCallId, state, options, callbacks } = ctx
+
+  const demangle = demangleName(toolName)
+  if (!demangle) {
+    pushToolResult(state, callbacks, toolCallId, toolName, `Error: Invalid MCP tool name "${toolName}"`, true)
+    return
+  }
+  const { serverName, toolName: localToolName } = demangle
+
+  const mcpRegistry = options.mcpRegistry
+  if (!mcpRegistry) {
+    pushToolResult(
+      state,
+      callbacks,
+      toolCallId,
+      toolName,
+      `Error: No MCP registry available (tried to call "${toolName}")`,
+      true,
+    )
+    return
+  }
+
+  // 权限检查：trustMode 或 always-allow 跳过；否则询问用户
+  const cwd = process.cwd()
+  const alreadyAllowed = options.trustMode || isMcpToolAlwaysAllowed(toolName, cwd)
+
+  if (!alreadyAllowed) {
+    let decision: 'yes' | 'always' | 'no'
+    try {
+      decision = await callbacks.onAskPermission({ toolCallId, toolName, input })
+    } catch {
+      decision = 'no'
+    }
+
+    if (options.abortSignal?.aborted) {
+      pushToolResult(state, callbacks, toolCallId, toolName, '[Tool execution interrupted by user]', true)
+      return
+    }
+
+    if (decision === 'no') {
+      pushToolResult(state, callbacks, toolCallId, toolName, 'Permission denied by user.', false)
+      return
+    }
+
+    if (decision === 'always') {
+      // 检查是否允许整个服务器（如果这是该服务器的第一次批准）
+      // 这里简化处理：always 表示工具级别的持久化允许
+      allowMcpTool(toolName, cwd)
+    }
+  }
+
+  // 执行 MCP 工具调用
+  reportProgress(toolCallId, `Calling ${serverName}/${localToolName}...`)
+
+  const output = await mcpRegistry.callTool(serverName, localToolName, input, options.abortSignal)
+  const isError = output.startsWith('Error:')
+  pushToolResult(state, callbacks, toolCallId, toolName, truncateToolResult(output), isError)
+}
+
 // ── BYPASS_LOOP_GUARD_HANDLERS ────────────────────────────────────────────────
 
 type ToolHandler = (ctx: HandlerCtx) => Promise<void>
 
 /** 绕过循环守卫和 writeFile/edit/shell 权限+执行管道的特殊工具。
  *  每个处理器负责自己调用 pushToolResult。
- *  task6 只有 askUser；task15 新增 task。*/
+ *  task6 只有 askUser；task15 新增 task。
+ *  task16 注意：MCP 工具不在此列（需要循环守卫）。*/
 const BYPASS_LOOP_GUARD_HANDLERS: Record<string, ToolHandler> = {
   askUser: handleAskUser,
   task: handleTaskTool,
@@ -451,9 +539,17 @@ async function handleToolCall(
     return
   }
 
-  // 循环守卫
+  // 循环守卫（所有工具，包括 MCP）
   if (await applyLoopGuard(ctx, deferred)) return
-  // 权限检查
+
+  // task16：MCP 工具路由（命名空间化工具名含 "__" 分隔符）
+  // MCP 工具有专属权限检查逻辑，不走 checkWriteOrShellPermission
+  if (isMangledName(ctx.toolName)) {
+    await handleMcpToolCall(ctx)
+    return
+  }
+
+  // 内置手动工具（writeFile/edit/shell）的权限检查
   if (!(await checkWriteOrShellPermission(ctx))) return
 
   // 执行工具体

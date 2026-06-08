@@ -52,6 +52,11 @@ export interface AgentOptions {
   abortSignal?: AbortSignal
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   modelRegistry?: { languageModel: (...args: any[]) => LanguageModel }
+  /** task16 新增：MCP 注册表（含所有已连接服务器）。
+   *  由 CLI 在启动时调用 loadMcpFromDisk() 初始化，传给 agentLoop。
+   *  buildTools() 通过此字段注入 MCP 工具。*/
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mcpRegistry?: any  // McpRegistry — 避免循环依赖，使用 any
 }
 
 // ─── Model aliases ───
