@@ -46,6 +46,8 @@
 //           ├─ 'stop'    → appendUsage → break（正常结束）
 //           ├─ 'tool-calls' → processToolCalls → continue（ReAct 循环）
 //           └─ 'length'  → push 续写提示 → continue（最多 3 次）
+import * as childProcess from 'node:child_process'
+
 import { streamText } from 'ai'
 import type { LanguageModel, UserContent } from 'ai'
 
@@ -55,6 +57,9 @@ import { createTaskTool } from '../tools/task.js'
 import { clearProgressReporter, setProgressReporter } from '../tools/progress.js'
 import { bridgeAllMcpTools } from '../mcp/tool-bridge.js'
 import type { AgentCallbacks, AgentOptions } from '../types/index.js'
+import { buildKnowledgeContext } from '../knowledge/loader.js'
+import { buildSystemPrompt } from './system-prompt.js'
+import { runMemoryExtractor } from './memory-extractor.js'
 import { createLoopState } from './loop-state.js'
 import type { LoopState } from './loop-state.js'
 import { checkAndCompressContext } from './compression.js'
@@ -64,6 +69,26 @@ import { drainStreamResult } from './stream-utils.js'
 import type { StreamResult } from './stream-utils.js'
 import { processToolCalls } from './tool-execution.js'
 import { repairOrphanToolCalls, truncateToolResultsInMessages } from './tool-result-sanitize.js'
+
+// ── detectIsGitRepo ───────────────────────────────────────────────────────────
+
+/** 检测 cwd 是否位于 git 仓库内。
+ *
+ *  使用 spawnSync 同步执行 `git rev-parse --is-inside-work-tree`，
+ *  避免引入异步复杂度（仅在 session 初始化时调用一次）。
+ *  任何失败（命令不存在、非 git 目录）均返回 false，静默降级。*/
+function detectIsGitRepo(cwd: string = process.cwd()): boolean {
+  try {
+    const result = childProcess.spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd,
+      encoding: 'utf-8',
+      timeout: 2000,  // 2秒超时，避免挂起
+    })
+    return result.status === 0 && result.stdout.trim() === 'true'
+  } catch {
+    return false
+  }
+}
 
 // ── 重导出 ───────────────────────────────────────────────────────────────────
 
@@ -375,10 +400,15 @@ export async function agentLoop(
 
   let turn = 0
 
-  // task6 使用静态系统提示，task-A 会替换为 buildSystemPrompt()
-  const systemPrompt =
-    options.systemPromptExtra ??
-    "You are a helpful AI assistant. Respond concisely and accurately to the user's questions."
+  // ── task-A：初始化知识系统（仅新建 state 时）────────────────────────────────
+  // existingState 续传时 knowledgeContext 已填充，直接复用。
+  if (!existingState) {
+    state.knowledgeContext = buildKnowledgeContext(cwd)
+    state.isGitRepo = detectIsGitRepo(cwd)
+  }
+
+  // 记录循环开始前已有的消息数（memory extractor 判断新增部分）
+  const messageCountBeforeLoop = state.messages.length - 1
 
   // 构建工具集（本次 session 内稳定，不需要每轮重建）
   // task15：如果传入 toolsOverride（sub-agent 场景），buildTools 直接返回它
@@ -418,7 +448,17 @@ export async function agentLoop(
       )
     }
 
-    const outcome = await runTurn(state, model, options, systemPrompt, callbacks, effectiveTools)
+    // ── task-A：获取/重建系统提示 ──────────────────────────────────────────────
+    // 使用缓存的系统提示（字节稳定，保证 prefix cache 命中）。
+    // state.systemPromptCache 在以下情况会被清空（由 tool-execution.ts 置 null）：
+    //   - permissionMode 变化（如用户批准计划后切换到 acceptEdits 模式）
+    // 清空后下一轮重建，重建后缓存直到下次清空。
+    if (!state.systemPromptCache) {
+      const isPlanMode = state.permissionMode === 'plan'
+      state.systemPromptCache = options.systemPromptExtra ?? buildSystemPrompt(state.knowledgeContext, isPlanMode)
+    }
+
+    const outcome = await runTurn(state, model, options, state.systemPromptCache, callbacks, effectiveTools)
 
     if (outcome.kind === 'error') break
     if (outcome.kind === 'aborted') break
@@ -469,6 +509,11 @@ export async function agentLoop(
       } catch {
         // 写 usage 失败不影响主流程
       }
+
+      // ── task-A：异步记忆提取（fire-and-forget）────────────────────────────
+      // 正常结束后，异步提取本轮新增对话的关键事实，写入 auto-memory.md。
+      // 不 await — 不阻塞主流程，失败完全静默。
+      void runMemoryExtractor(state.messages, messageCountBeforeLoop, model, cwd)
     }
 
     if (outcome.finishReason === 'content-filter') {

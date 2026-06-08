@@ -61,6 +61,18 @@ export interface LoopState {
    *  或由 hydrateLoopState 从 LoadedSession 恢复。
    *  空字符串表示未设置（显示时用 firstPrompt 代替）。*/
   taskSlug: string
+
+  // ── task-A 新增：知识系统字段 ────────────────────────────────────────────────
+
+  /** 5 层 AGENTS.md 合并后的知识上下文（session 内不变）。
+   *  首轮 agentLoop 启动前由 buildKnowledgeContext() 填充，
+   *  后续 turn 直接复用（字节稳定，保证 prefix cache 命中）。
+   *  空字符串表示无用户/项目知识文件。*/
+  knowledgeContext: string
+  /** 当前工作目录是否是 git 仓库。
+   *  首轮启动时检测，后续 turn 复用。
+   *  用于在系统提示中决定是否显示 git 相关工具说明。*/
+  isGitRepo: boolean
 }
 
 // ── generateSessionId ────────────────────────────────────────────────────────
@@ -104,5 +116,8 @@ export function createLoopState(initialMode: PermissionMode = 'default'): LoopSt
     persistedMessageCount: 0,
     sessionFilePath: null,
     taskSlug: '',
+    // task-A 新增：知识系统初始值（由 agentLoop 在首轮前填充）
+    knowledgeContext: '',
+    isGitRepo: false,
   }
 }

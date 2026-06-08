@@ -8,7 +8,7 @@
 
 ## 阶段一：工程框架
 
-- [ ] 1. 搭建 pnpm monorepo 双包结构
+- [x] 1. 搭建 pnpm monorepo 双包结构
   - 创建 `pnpm-workspace.yaml`，声明 `packages/*`
   - 创建 `packages/core/package.json`：`"type": "module"`，`"exports"` 指向 `dist/`
   - 创建 `packages/cli/package.json`：`"bin": {"xc": "dist/cli.js"}`，依赖 `@x-code-cli/core: workspace:*`
@@ -17,7 +17,7 @@
   - 配置根 `package.json` 的 `build` / `test` / `typecheck` 脚本
   - _需求：工程化基础_
 
-- [ ] 2. 实现 Provider 注册表（最小 Anthropic 接入）
+- [x] 2. 实现 Provider 注册表（最小 Anthropic 接入）
   - 创建 `packages/core/src/config/index.ts`：从环境变量读取各厂商 API Key
   - 创建 `packages/core/src/providers/registry.ts`：`createModelRegistry()` 使用 `createProviderRegistry`
   - 接入 Anthropic：`createAnthropic({ fetch: permanentErrorFetch })`
@@ -25,12 +25,12 @@
   - 实现 `getAvailableProviders()` 和 `resolveModelId()`
   - _需求：需求 1.1, 1.2, 1.5_
 
-- [ ] 2.1 为 permanentErrorFetch 编写属性测试（使用 TestAgent 工具）
+- [x] 2.1 为 permanentErrorFetch 编写属性测试（使用 TestAgent 工具）
   - **Property 5：工具结果截断保留前缀**
   - 对各类错误关键词生成随机 HTTP 响应体，验证状态码重写正确
   - _需求：需求 1.6_
 
-- [ ] 3. 实现最简 agentLoop（单轮 streamText）
+- [x] 3. 实现最简 agentLoop（单轮 streamText）
   - 创建 `packages/core/src/agent/loop-state.ts`：`createLoopState()` 和 `LoopState` 接口
   - 创建 `packages/core/src/agent/loop.ts`（骨架）：单轮 `streamText` 调用
   - 实现 `streamChunksToUI`：迭代 `fullStream`，分发 `text-delta` / `tool-call` / `tool-result`
@@ -43,7 +43,7 @@
 
 ## 阶段二：工具系统
 
-- [ ] 4. 实现基础文件工具
+- [x] 4. 实现基础文件工具
   - 创建 `packages/core/src/tools/read-file.ts`：带行号的文件读取，auto-execute
   - 创建 `packages/core/src/tools/write-file.ts`：工具 schema（无 execute，需手动分发）
   - 创建 `packages/core/src/tools/list-dir.ts`：目录列表，auto-execute
@@ -53,12 +53,12 @@
   - 创建 `packages/core/src/tools/index.ts`：导出 `toolRegistry` 和 `truncateToolResult`
   - _需求：需求 3.1_
 
-- [ ] 4.1 使用 TestAgent 工具为文件工具编写单元测试
+- [x] 4.1 使用 TestAgent 工具为文件工具编写单元测试
   - 测试 readFile 带行号输出、ENOENT 错误、大文件截断
   - 测试 edit 的唯一匹配检查、replaceAll 模式
   - _需求：需求 3.1_
 
-- [ ] 5. 实现 Shell 工具 + 权限系统
+- [x] 5. 实现 Shell 工具 + 权限系统
   - 创建 `packages/core/src/tools/shell-provider.ts`：跨平台 shell 检测（bash/zsh/powershell）
   - 创建 `packages/core/src/tools/shell-utils.ts`：命令分类、引号感知分词、LRU 缓存
   - 创建 `packages/core/src/tools/shell.ts`：shell 工具 schema（无 execute）
@@ -66,12 +66,12 @@
   - 创建 `packages/core/src/permissions/session-store.ts`：会话级 always-allow 内存存储
   - _需求：需求 3.2, 4.1-4.5_
 
-- [ ] 5.1 为权限系统编写属性测试（使用 TestAgent 工具）
+- [x] 5.1 为权限系统编写属性测试（使用 TestAgent 工具）
   - **Property 3：权限 3 级决策完备性**
   - 验证 trustMode=true 永远返回 true；plan 模式对写工具返回 false
   - _需求：需求 4.1, 4.4, 4.5_
 
-- [ ] 6. 实现工具调用循环（完整 ReAct）
+- [x] 6. 实现工具调用循环（完整 ReAct）
   - 创建 `packages/core/src/agent/messages.ts`：`toolResultMessage`、`toolErrorString` 等消息构造工具函数
   - 创建 `packages/core/src/agent/loop-guard.ts`：滑动窗口哈希检测，`checkForLoop` / `recordToolCall`
   - 创建 `packages/core/src/agent/tool-execution.ts`：`processToolCalls`、`handleToolCall`
@@ -83,7 +83,7 @@
   - 创建 `packages/core/src/agent/tool-result-sanitize.ts`：`repairOrphanToolCalls`、`truncateToolResultsInMessages`
   - _需求：需求 2.2, 2.3, 2.5, 2.8_
 
-- [ ] 6.1 为 repairOrphanToolCalls 编写属性测试（使用 TestAgent 工具）
+- [x] 6.1 为 repairOrphanToolCalls 编写属性测试（使用 TestAgent 工具）
   - **Property 1：工具调用配对不变量**
   - 生成包含随机孤立 tool_call 的消息数组，验证修复后每个 call 都有 result
   - _需求：需求 2.8_
@@ -92,7 +92,7 @@
 
 ## 阶段三：Ink TUI
 
-- [ ] 7. 实现最简 Ink 应用
+- [x] 7. 实现最简 Ink 应用
   - 创建 `packages/cli/src/index.ts`：yargs 解析 `--model`、`--trust`、`--print`、`--plan` 参数
   - 实现 `checkNodeVersion()`、`loadEnvFile()`、`resetTerminal()`
   - 实现 `gracefulShutdown()`：优雅退出，打印 resume 提示
@@ -102,7 +102,7 @@
   - 配置 `esbuild.config.js` 打包脚本
   - _需求：需求 5（框架）_
 
-- [ ] 8. 实现 ChatInput cell buffer 渲染
+- [x] 8. 实现 ChatInput cell buffer 渲染
   - 创建 `packages/cli/src/ui/chat-input/types.ts`：`Cell`、`CellGrid`、`CellRow` 类型定义
   - 创建 `packages/cli/src/ui/chat-input/cells.ts`：`buildCellGrid`、`diffCellGrid`、cell diff 算法
   - 创建 `packages/cli/src/ui/text-width.ts`：CJK 双宽字符宽度计算
@@ -136,7 +136,7 @@
   - 实现 spinner（"Thinking…" / "Reading…" 状态切换）
   - _需求：需求 5.3, 5.4_
 
-- [ ] 11. 实现 Markdown 渲染 + 代码高亮
+- [x] 11. 实现 Markdown 渲染 + 代码高亮
   - 创建 `packages/cli/src/ui/render-markdown.ts`：使用 `marked` 解析，chalk 渲染标题/列表/引用/代码块
   - 创建 `packages/cli/src/ui/syntax-highlight.ts`：代码块语法高亮（可选 prism）
   - 创建 `packages/cli/src/ui/render-diff.ts`：edit 工具的彩色 diff 渲染（`+` 绿、`-` 红）
@@ -156,7 +156,7 @@
   - 在 `App.tsx` 中实现 `/model` 斜杠命令：弹 `askQuestion` picker → `switchModel`
   - _需求：需求 1.1-1.6_
 
-- [ ] 13. Prompt Caching（Anthropic + OpenAI）
+- [x] 13. Prompt Caching（Anthropic + OpenAI）
   - 创建 `packages/core/src/providers/cache-control.ts`：`applyCacheControl()`
     - Anthropic：在系统提示 + 最后 3 条工具/消息注入 `cache_control: {type:'ephemeral'}`（最多4个断点）
     - OpenAI：设置 `promptCacheKey: sessionId`
@@ -165,13 +165,13 @@
   - 在 `loop.ts` 的 `runTurn` 中调用 `applyCacheControl`
   - _需求：需求 7.2_
 
-- [ ] 13.1 为 cache-control 编写属性测试（使用 TestAgent 工具）
+- [x] 13.1 为 cache-control 编写属性测试（使用 TestAgent 工具）
   - **Property 2：系统提示幂等性**
   - 验证相同参数两次调用 `buildSystemPrompt` 结果字节相同
   - 验证 `applyCacheControl` 注入的 Anthropic 断点数不超过 4 个
   - _需求：需求 7.2_
 
-- [ ] 14. Context 压缩 + 会话持久化
+- [x] 14. Context 压缩 + 会话持久化
   - 创建 `packages/core/src/agent/session-store.ts`：
     - `appendHeader`：写入 JSONL header 行（idempotent）
     - `flushPendingMessages`：增量追加 `messages.slice(persistedCount)`
@@ -185,12 +185,12 @@
   - 实现 `hydrateLoopState(session, permissionMode)`：从 LoadedSession 重建 LoopState
   - _需求：需求 6.1-6.4_
 
-- [ ] 14.1 为会话持久化编写属性测试（使用 TestAgent 工具）
+- [x] 14.1 为会话持久化编写属性测试（使用 TestAgent 工具）
   - **Property 4：JSONL 会话写读一致性**
   - 生成随机消息数组，写入后读出，验证内容完全相同
   - _需求：需求 6.1_
 
-- [ ] 15. Sub-Agent（task 工具）
+- [x] 15. Sub-Agent（task 工具）
   - 创建 `packages/core/src/agent/sub-agents/types.ts`：`SubAgentDef`、`SubAgentRegistry` 接口
   - 创建 `packages/core/src/agent/sub-agents/built-in.ts`：4 个内置 agent（explore/general-purpose/plan/code-reviewer）的工具白名单和系统提示
   - 创建 `packages/core/src/agent/sub-agents/loader.ts`：从 `~/.x-code/agents/*.md` 和项目 `.x-code/agents/*.md` 加载自定义 agent
@@ -204,7 +204,7 @@
 
 ## 阶段六：生态扩展
 
-- [ ] 16. MCP 协议集成
+- [x] 16. MCP 协议集成
   - 创建 `packages/core/src/mcp/types.ts`：`McpServerConfig`、`McpEntry`、`McpRegistry` 接口
   - 创建 `packages/core/src/mcp/client.ts`：`McpClient` 包装 `@modelcontextprotocol/sdk`，支持 stdio/HTTP transport
   - 创建 `packages/core/src/mcp/name-mangling.ts`：`<server>__<tool>` 名称处理，防冲突
@@ -221,7 +221,7 @@
 
 ## 附加：知识系统与系统提示
 
-- [ ] A. 实现知识系统（AGENTS.md 5层合并）
+- [x] A. 实现知识系统（AGENTS.md 5层合并）
   - 创建 `packages/core/src/knowledge/loader.ts`：`buildKnowledgeContext()` 合并 5 层
   - 创建 `packages/core/src/knowledge/auto-memory.ts`：读写 auto-memory.md
   - 创建 `packages/core/src/agent/memory-extractor.ts`：`runMemoryExtractor()`，每轮 stop 后异步提取事实

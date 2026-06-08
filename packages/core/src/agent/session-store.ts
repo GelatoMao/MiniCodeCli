@@ -433,6 +433,9 @@ export function hydrateLoopState(
     recentToolCalls: [],
     persistedMessageCount: session.messages.length,
     sessionFilePath: filePath,
+    // task-A 新增：知识系统字段（会话恢复时由 agentLoop 首轮重新构建）
+    knowledgeContext: '',
+    isGitRepo: false,
   }
 }
 
