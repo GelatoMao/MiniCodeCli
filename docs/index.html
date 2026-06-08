@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mini-code-cli — 终端 AI 编程助手</title>
+  <meta name="description" content="一个运行在终端里的 AI 编程助手，支持 8 家主流模型厂商，具备文件读写、Shell 执行、代码搜索、MCP 协议扩展等能力。" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d1117;
+      --bg2: #161b22;
+      --bg3: #21262d;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent2: #3fb950;
+      --accent3: #d2a8ff;
+      --accent4: #ffa657;
+      --danger: #f85149;
+      --radius: 8px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Nav ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+    }
+    .nav-brand {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .nav-brand .icon { font-size: 1.3rem; }
+    .nav-links { display: flex; gap: 1.5rem; font-size: 0.9rem; }
+    .nav-links a { color: var(--text-muted); }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+    .nav-cta {
+      background: var(--accent);
+      color: #0d1117 !important;
+      padding: 6px 16px;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .nav-cta:hover { background: #79c0ff; text-decoration: none !important; }
+
+    /* ── Hero ── */
+    .hero {
+      padding: 6rem 2rem 4rem;
+      text-align: center;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+    .hero-badge {
+      display: inline-block;
+      background: rgba(88, 166, 255, 0.1);
+      border: 1px solid rgba(88, 166, 255, 0.3);
+      color: var(--accent);
+      padding: 4px 14px;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 1.5rem;
+    }
+    .hero h1 {
+      font-size: clamp(2.2rem, 5vw, 3.5rem);
+      font-weight: 800;
+      line-height: 1.2;
+      margin-bottom: 1.2rem;
+      background: linear-gradient(135deg, #e6edf3 0%, #58a6ff 60%, #3fb950 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero-desc {
+      font-size: 1.15rem;
+      color: var(--text-muted);
+      max-width: 600px;
+      margin: 0 auto 2.5rem;
+    }
+    .hero-actions { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 22px;
+      border-radius: var(--radius);
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0d1117;
+    }
+    .btn-primary:hover { background: #79c0ff; text-decoration: none; }
+    .btn-secondary {
+      background: var(--bg3);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { background: var(--border); text-decoration: none; }
+
+    /* ── Terminal Demo ── */
+    .terminal-wrap {
+      max-width: 780px;
+      margin: 3rem auto 0;
+      padding: 0 2rem;
+    }
+    .terminal {
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    }
+    .terminal-bar {
+      background: var(--bg3);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; }
+    .dot-red { background: #ff5f57; }
+    .dot-yellow { background: #febc2e; }
+    .dot-green { background: #28c840; }
+    .terminal-title { flex: 1; text-align: center; font-size: 0.8rem; color: var(--text-muted); }
+    .terminal-body {
+      padding: 1.2rem 1.5rem;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+      font-size: 0.85rem;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+    .t-prompt { color: var(--accent2); }
+    .t-cmd { color: var(--text); }
+    .t-comment { color: var(--text-muted); }
+    .t-output { color: #adbac7; }
+    .t-thinking { color: var(--accent4); }
+    .t-tool { color: var(--accent3); }
+    .t-result { color: var(--accent2); }
+    .t-user { color: var(--accent); }
+
+    /* ── Section ── */
+    section { padding: 5rem 2rem; }
+    .section-inner { max-width: 1100px; margin: 0 auto; }
+    .section-label {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 0.75rem;
+    }
+    .section-title {
+      font-size: clamp(1.6rem, 3vw, 2.2rem);
+      font-weight: 700;
+      margin-bottom: 1rem;
+    }
+    .section-desc {
+      color: var(--text-muted);
+      font-size: 1.05rem;
+      max-width: 560px;
+      margin-bottom: 3rem;
+    }
+
+    /* ── Feature Grid ── */
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 1.25rem;
+    }
+    .feature-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .feature-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .feature-icon { font-size: 1.6rem; margin-bottom: 0.75rem; }
+    .feature-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .feature-card p { font-size: 0.9rem; color: var(--text-muted); line-height: 1.6; }
+
+    /* ── Provider Pills ── */
+    .providers-section { background: var(--bg2); }
+    .provider-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-top: 2rem;
+    }
+    .pill {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      padding: 6px 16px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .pill-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); }
+
+    /* ── Install ── */
+    .install-section { background: linear-gradient(180deg, var(--bg) 0%, rgba(88,166,255,0.04) 100%); }
+    .install-box {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      max-width: 640px;
+    }
+    .install-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+    }
+    .install-tab {
+      padding: 10px 20px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .install-tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    .install-content { padding: 1.25rem 1.5rem; }
+    .code-block {
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem 1.2rem;
+      font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+      font-size: 0.85rem;
+      color: var(--text);
+      white-space: pre;
+      overflow-x: auto;
+      position: relative;
+    }
+    .code-block .kw { color: var(--accent4); }
+    .code-block .str { color: var(--accent2); }
+    .code-block .cmt { color: var(--text-muted); }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+
+    /* ── Modes ── */
+    .modes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1.25rem;
+    }
+    .mode-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+    }
+    .mode-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      font-family: monospace;
+    }
+    .badge-default { background: rgba(63,185,80,0.15); color: var(--accent2); }
+    .badge-trust   { background: rgba(255,166,87,0.15); color: var(--accent4); }
+    .badge-plan    { background: rgba(210,168,255,0.15); color: var(--accent3); }
+    .mode-card h3  { font-size: 1rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .mode-card p   { font-size: 0.9rem; color: var(--text-muted); }
+
+    /* ── Tools Table ── */
+    .tools-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    .tools-table th {
+      text-align: left;
+      padding: 10px 16px;
+      background: var(--bg3);
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    .tools-table td {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .tools-table tr:last-child td { border-bottom: none; }
+    .tools-table tr:hover td { background: var(--bg2); }
+    .tool-name {
+      font-family: monospace;
+      color: var(--accent3);
+      font-weight: 600;
+    }
+    .tools-wrap {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    /* ── Knowledge ── */
+    .knowledge-section { background: var(--bg2); }
+    .layers-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 700px;
+    }
+    .layer {
+      display: flex;
+      gap: 1rem;
+      padding: 1rem 0;
+      border-bottom: 1px solid var(--border);
+      align-items: flex-start;
+    }
+    .layer:last-child { border-bottom: none; }
+    .layer-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: rgba(88,166,255,0.1);
+      border: 1px solid rgba(88,166,255,0.3);
+      color: var(--accent);
+      font-size: 0.8rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .layer-info h4 { font-size: 0.9rem; font-weight: 600; margin-bottom: 2px; }
+    .layer-info code {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      background: var(--bg3);
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+    .layer-high { border-left: 3px solid var(--accent2); padding-left: 0.5rem; }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2.5rem 2rem;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+    }
+    footer a { color: var(--text-muted); }
+    footer a:hover { color: var(--text); }
+    .footer-links { display: flex; justify-content: center; gap: 1.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+
+    /* ── Responsive ── */
+    @media (max-width: 640px) {
+      nav { padding: 0 1rem; }
+      .nav-links { display: none; }
+      section { padding: 3.5rem 1rem; }
+      .hero { padding: 4rem 1rem 2.5rem; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+  <div class="nav-brand">
+    <span class="icon">⚡</span>
+    mini-code-cli
+  </div>
+  <div class="nav-links">
+    <a href="#features">功能</a>
+    <a href="#install">安装</a>
+    <a href="#providers">模型支持</a>
+    <a href="#tools">工具</a>
+    <a href="#knowledge">知识系统</a>
+    <a href="https://github.com/maolu/mini-code-cli" target="_blank" class="nav-cta">GitHub →</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<div class="hero">
+  <div class="hero-badge">Terminal AI Coding Assistant</div>
+  <h1>在终端里的<br />AI 编程搭档</h1>
+  <p class="hero-desc">
+    支持 8 家主流 AI 厂商，具备文件读写、Shell 执行、代码搜索、MCP 扩展等能力。
+    从 Claude 到 DeepSeek，一个命令搞定一切。
+  </p>
+  <div class="hero-actions">
+    <a href="#install" class="btn btn-primary">⚡ 立即安装</a>
+    <a href="https://github.com/maolu/mini-code-cli" target="_blank" class="btn btn-secondary">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      查看源码
+    </a>
+  </div>
+</div>
+
+<!-- Terminal Demo -->
+<div class="terminal-wrap">
+  <div class="terminal">
+    <div class="terminal-bar">
+      <div class="dot dot-red"></div>
+      <div class="dot dot-yellow"></div>
+      <div class="dot dot-green"></div>
+      <div class="terminal-title">mini-code — ~/my-project</div>
+    </div>
+    <div class="terminal-body">
+<span class="t-prompt">$</span> <span class="t-cmd">mc</span>
+<span class="t-output">  mini-code v0.1.0  •  claude-sonnet-4-5  •  ~/my-project</span>
+<span class="t-output">  Type your message. Press Ctrl+C to exit.</span>
+
+<span class="t-user">❯ 帮我找出 src/ 下所有超过 100 行的 TypeScript 文件，然后列出最长的 3 个</span>
+
+<span class="t-thinking">  Thinking…</span>
+
+<span class="t-tool">  ⎿ glob: src/**/*.ts  →  found 24 files  [12ms]</span>
+<span class="t-tool">  ⎿ shell: wc -l src/**/*.ts | sort -rn | head -5  [48ms]</span>
+
+<span class="t-output">  最长的 3 个文件：</span>
+<span class="t-result">  1. src/agent/loop.ts          533 行</span>
+<span class="t-result">  2. src/agent/session-store.ts 451 行</span>
+<span class="t-result">  3. src/agent/tool-execution.ts 318 行</span>
+
+<span class="t-user">❯ loop.ts 的 runTurn 函数太长了，帮我拆分一下</span>
+
+<span class="t-thinking">  Thinking…</span>
+<span class="t-tool">  ⎿ readFile: src/agent/loop.ts  [8ms]</span>
+<span class="t-tool">  ⎿ edit: src/agent/loop.ts  ✓  [confirmed]</span>
+<span class="t-result">  ✓ 已将 runTurn 拆分为 3 个函数：buildMessages、runTurn、collectResponse</span>
+    </div>
+  </div>
+</div>
+
+<!-- Features -->
+<section id="features">
+  <div class="section-inner">
+    <div class="section-label">核心能力</div>
+    <h2 class="section-title">为开发者构建的 AI 助手</h2>
+    <p class="section-desc">不只是聊天，而是真正能操作你的代码库的智能 Agent。</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <div class="feature-icon">🔄</div>
+        <h3>ReAct Agent 循环</h3>
+        <p>自主思考 → 调用工具 → 观察结果 → 继续推理，直到完成任务。支持多轮工具调用和死循环检测。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">📁</div>
+        <h3>完整文件操作</h3>
+        <p>读取、创建、精确编辑文件，支持带行号输出、大文件截断、字符串替换 patch，绝不破坏无关代码。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔍</div>
+        <h3>代码搜索</h3>
+        <p>基于 ripgrep 的高性能正则搜索，以及 glob 文件模式匹配，快速定位代码位置。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🐚</div>
+        <h3>Shell 执行</h3>
+        <p>流式输出，50ms 节流渲染，支持 bash/zsh/powershell。运行测试、git 操作、构建命令一气呵成。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🤖</div>
+        <h3>Sub-Agent 并行</h3>
+        <p>通过 task 工具拆解复杂任务，启动子 Agent 并行执行，token 消耗自动汇总到主会话。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🔌</div>
+        <h3>MCP 协议扩展</h3>
+        <p>支持 stdio 和 HTTP 两种 MCP 传输方式，接入任意 MCP 服务器，无限扩展工具能力。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">💾</div>
+        <h3>会话持久化</h3>
+        <p>对话自动以 JSONL 格式保存，支持跨 session 恢复。上下文超限时自动 LLM 压缩摘要，保持连续性。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">⚡</div>
+        <h3>Prompt Caching</h3>
+        <p>Anthropic 自动注入最多 4 个 cache_control 断点，OpenAI 设置 promptCacheKey，系统提示字节稳定保证缓存命中。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">🧠</div>
+        <h3>知识系统</h3>
+        <p>5 层 AGENTS.md 优先级合并，Agent 自动提取事实写入 auto-memory，项目规范无需反复说明。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Install -->
+<section id="install" class="install-section">
+  <div class="section-inner">
+    <div class="section-label">快速开始</div>
+    <h2 class="section-title">一分钟上手</h2>
+    <p class="section-desc">全局安装后，在任意项目目录启动即可。</p>
+
+    <div style="display: flex; flex-direction: column; gap: 2rem; max-width: 640px;">
+
+      <div>
+        <h3 style="margin-bottom: 0.75rem; font-size: 1rem; color: var(--text-muted);">① 安装</h3>
+        <div class="code-block">npm install -g @mini-code-cli/cli<button class="copy-btn" onclick="copy(this,'npm install -g @mini-code-cli/cli')">复制</button></div>
+      </div>
+
+      <div>
+        <h3 style="margin-bottom: 0.75rem; font-size: 1rem; color: var(--text-muted);">② 配置 API Key（以 Anthropic 为例）</h3>
+        <div class="code-block"><span class="kw">export</span> ANTHROPIC_API_KEY=<span class="str">sk-ant-...</span>
+<span class="cmt"># 或写入项目 .env 文件，自动加载</span><button class="copy-btn" onclick="copy(this,'export ANTHROPIC_API_KEY=sk-ant-...')">复制</button></div>
+      </div>
+
+      <div>
+        <h3 style="margin-bottom: 0.75rem; font-size: 1rem; color: var(--text-muted);">③ 启动</h3>
+        <div class="code-block">mc<span class="cmt">          # 短命令</span>
+mini-code <span class="cmt">  # 完整命令</span><button class="copy-btn" onclick="copy(this,'mc')">复制</button></div>
+      </div>
+
+      <div>
+        <h3 style="margin-bottom: 0.75rem; font-size: 1rem; color: var(--text-muted);">④ 常用示例</h3>
+        <div class="code-block"><span class="cmt"># 指定模型</span>
+mc --model deepseek
+
+<span class="cmt"># 信任模式（跳过确认）</span>
+mc --trust
+
+<span class="cmt"># 计划模式（只读分析）</span>
+mc --plan
+
+<span class="cmt"># 非交互单次输出</span>
+mc -p <span class="str">"解释这个函数的作用"</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Providers -->
+<section id="providers" class="providers-section">
+  <div class="section-inner">
+    <div class="section-label">模型支持</div>
+    <h2 class="section-title">8 家主流 AI 厂商</h2>
+    <p class="section-desc">设置对应的环境变量即可使用，支持短别名快速切换。</p>
+    <div class="provider-pills">
+      <div class="pill"><span class="pill-dot"></span> Anthropic Claude</div>
+      <div class="pill"><span class="pill-dot"></span> OpenAI GPT / o1 / o3</div>
+      <div class="pill"><span class="pill-dot"></span> DeepSeek</div>
+      <div class="pill"><span class="pill-dot"></span> Google Gemini</div>
+      <div class="pill"><span class="pill-dot"></span> 阿里云 通义千问</div>
+      <div class="pill"><span class="pill-dot"></span> xAI Grok</div>
+      <div class="pill"><span class="pill-dot"></span> 智谱 GLM</div>
+      <div class="pill"><span class="pill-dot"></span> Moonshot Kimi</div>
+      <div class="pill"><span class="pill-dot" style="background:var(--text-muted)"></span> OpenAI 兼容接口</div>
+    </div>
+    <div style="margin-top: 2rem;">
+      <div class="code-block" style="max-width: 520px;"><span class="cmt"># 使用短别名</span>
+mc --model sonnet       <span class="cmt"># claude-sonnet-4-5</span>
+mc --model deepseek-r1  <span class="cmt"># deepseek-reasoner</span>
+mc --model gemini       <span class="cmt"># gemini-2.0-flash</span>
+mc --model kimi         <span class="cmt"># moonshot-v1-8k</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- Modes -->
+<section id="modes">
+  <div class="section-inner">
+    <div class="section-label">工作模式</div>
+    <h2 class="section-title">三种权限模式</h2>
+    <p class="section-desc">根据场景选择合适的安全策略。</p>
+    <div class="modes-grid">
+      <div class="mode-card">
+        <div class="mode-badge badge-default">default</div>
+        <h3>默认模式</h3>
+        <p>写操作（编辑文件、执行 Shell）前弹出权限确认。支持一次性允许、本 session 始终允许、拒绝三种选择。</p>
+      </div>
+      <div class="mode-card">
+        <div class="mode-badge badge-trust">--trust</div>
+        <h3>信任模式</h3>
+        <p>跳过所有权限确认，Agent 可以自由执行所有操作。适合在受控 CI 环境或你完全信任的场景中使用。</p>
+      </div>
+      <div class="mode-card">
+        <div class="mode-badge badge-plan">--plan</div>
+        <h3>计划模式</h3>
+        <p>只读模式，Agent 只能读取文件和分析代码。先让 AI 制定方案，确认后再切换到普通模式执行。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Tools -->
+<section id="tools" style="background: var(--bg2);">
+  <div class="section-inner">
+    <div class="section-label">内置工具</div>
+    <h2 class="section-title">Agent 的工具箱</h2>
+    <p class="section-desc">8 个内置工具覆盖日常编程所有场景，MCP 协议支持无限扩展。</p>
+    <div class="tools-wrap">
+      <table class="tools-table">
+        <thead>
+          <tr><th>工具</th><th>功能描述</th><th>特点</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="tool-name">readFile</span></td><td>读取文件内容</td><td>带行号输出，支持大文件自动截断</td></tr>
+          <tr><td><span class="tool-name">writeFile</span></td><td>创建新文件</td><td>需权限确认，目录不存在自动创建</td></tr>
+          <tr><td><span class="tool-name">edit</span></td><td>修改已有文件</td><td>精确字符串替换，支持 replaceAll 模式</td></tr>
+          <tr><td><span class="tool-name">listDir</span></td><td>列出目录内容</td><td>自动执行，无需确认</td></tr>
+          <tr><td><span class="tool-name">glob</span></td><td>文件模式搜索</td><td>基于 ripgrep，高性能</td></tr>
+          <tr><td><span class="tool-name">grep</span></td><td>代码内容搜索</td><td>正则匹配，支持上下文行数控制</td></tr>
+          <tr><td><span class="tool-name">shell</span></td><td>执行 Shell 命令</td><td>流式输出，50ms 节流，跨平台</td></tr>
+          <tr><td><span class="tool-name">task</span></td><td>调用 Sub-Agent</td><td>并行执行，token 汇聚，禁止递归</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- Knowledge -->
+<section id="knowledge" class="knowledge-section">
+  <div class="section-inner">
+    <div class="section-label">知识系统</div>
+    <h2 class="section-title">AGENTS.md 5 层上下文</h2>
+    <p class="section-desc">向 Agent 注入项目规范和个人偏好，优先级从低到高自动合并。</p>
+    <div class="layers-list">
+      <div class="layer">
+        <div class="layer-num">1</div>
+        <div class="layer-info">
+          <h4>用户全局规则</h4>
+          <code>~/.mini-code/AGENTS.md</code>
+          <p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">对所有项目生效的通用编码规范</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">2</div>
+        <div class="layer-info">
+          <h4>用户自动记忆</h4>
+          <code>~/.mini-code/auto-memory.md</code>
+          <p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">Agent 自动提取并记录的用户偏好</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">3</div>
+        <div class="layer-info">
+          <h4>项目规则链</h4>
+          <code>&lt;项目路径&gt;/AGENTS.md</code>
+          <p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">从 git 根目录到当前目录，越具体优先级越高</p>
+        </div>
+      </div>
+      <div class="layer">
+        <div class="layer-num">4</div>
+        <div class="layer-info">
+          <h4>项目自动记忆</h4>
+          <code>&lt;cwd&gt;/.mini-code/auto-memory.md</code>
+          <p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">Agent 自动记录的项目级事实</p>
+        </div>
+      </div>
+      <div class="layer layer-high">
+        <div class="layer-num" style="background:rgba(63,185,80,0.15);border-color:rgba(63,185,80,0.4);color:var(--accent2)">5</div>
+        <div class="layer-info">
+          <h4>本地私人偏好（最高优先级）</h4>
+          <code>&lt;cwd&gt;/AGENTS.local.md</code>
+          <p style="font-size:0.85rem;color:var(--text-muted);margin-top:4px;">个人专属配置，建议加入 .gitignore 不提交</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="footer-links">
+    <a href="https://github.com/maolu/mini-code-cli" target="_blank">GitHub</a>
+    <a href="https://github.com/maolu/mini-code-cli/blob/main/README.md" target="_blank">文档</a>
+    <a href="https://www.npmjs.com/package/@mini-code-cli/cli" target="_blank">npm</a>
+    <a href="https://github.com/maolu/mini-code-cli/issues" target="_blank">Issues</a>
+  </div>
+  <p>MIT License · Built with TypeScript · Powered by <a href="https://sdk.vercel.ai/" target="_blank">AI SDK</a></p>
+</footer>
+
+<script>
+  function copy(btn, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = '已复制 ✓';
+      setTimeout(() => btn.textContent = '复制', 1800);
+    });
+  }
+</script>
+</body>
+</html>
